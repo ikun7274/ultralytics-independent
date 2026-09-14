@@ -87,6 +87,22 @@ def _online_default(key: str) -> Any:
     return _ONLINE_DEFAULTS[key]
 
 
+def get_split_fraction(fraction, split: str):
+    """Return a split ratio/count, normalizing boundary values to 0.0 (none) or 1.0 (all).
+
+    Mirrored from the forked ``ultralytics.data.utils`` (added upstream after 8.4.126).
+    """
+    if isinstance(fraction, list) and split in (splits := ("train", "val", "test")):
+        index = splits.index(split)
+        fraction = fraction[index] if index < len(fraction) else 1.0
+    elif split != "train":
+        fraction = 1.0
+    fraction = float(fraction) if fraction in {0, 1} else fraction
+    if split in {"train", "val"} and fraction == 0:
+        raise ValueError(f"{split} fraction must select at least one image")
+    return fraction
+
+
 def _legacy_ims_cap(ni: int, batch_size: int) -> int:
     """Upstream's steady-state bound on ``self.ims``: ``min(ni, batch*8, 1000) - 1`` frames."""
     return max(1, min(ni, batch_size * 8, 1000) - 1)

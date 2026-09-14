@@ -1,6 +1,7 @@
 """Framework-free core kernels (numpy / cv2 only, zero Ultralytics dependency)."""
 
 from .degrade import (
+    _RATIO_PAD_COLORS,
     _WEATHER_TYPES,
     _OCCLUSION_TYPES,
     _apply_motion_blur,

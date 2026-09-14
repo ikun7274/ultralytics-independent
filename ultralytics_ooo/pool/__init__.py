@@ -10,6 +10,7 @@ from .constants import (
     _describe_ims_cap,
 )
 from .sampler import SegmentBases, GroupedImageSampler
+from .dataset import OnlinePoolDataset
 
 __all__ = [
     "_ONLINE_DEFAULTS",
@@ -21,4 +22,5 @@ __all__ = [
     "_describe_ims_cap",
     "SegmentBases",
     "GroupedImageSampler",
+    "OnlinePoolDataset",
 ]
