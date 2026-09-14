@@ -85,6 +85,11 @@ def install() -> None:
 
     patch_validator(DetectionValidator)
 
+    # Dual-metric whole-image second validation (best_whole.pt) on BaseTrainer; off by default.
+    from ultralytics_ooo.pool.dual import patch_dual_metric
+
+    patch_dual_metric(BaseTrainer)
+
     # Route the training dataloader through GroupedImageSampler when the pool is worth grouping.
     from ultralytics_ooo.pool.sampler import patch_build_dataloader
 
