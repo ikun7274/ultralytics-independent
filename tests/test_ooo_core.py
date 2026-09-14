@@ -1,7 +1,12 @@
-"""Stage-1 self-check: the extracted core kernels are bit-identical to the in-tree originals.
+"""Self-check for the extracted pure kernels in ultralytics_ooo.core.
 
 Run with the conda env:
     python -m pytest tests/test_ooo_core.py -q
+
+Note: the earlier "bit-identical to the in-tree refactored original" comparisons lived against the
+deleted 8.4.137 fork's extra functions (slice_geometry / online_degrade / _cap_long_side), which do
+not exist in pristine 8.4.126. That porting-correctness check already passed against the fork during
+extraction; here we only self-test the kernels we ship.
 """
 from __future__ import annotations
 
@@ -27,16 +32,6 @@ def test_core_imports_without_ultralytics(monkeypatch):
         sys.modules.update(saved)
 
 
-def test_slice_geometry_matches_original():
-    from ultralytics_ooo.core import slice_geometry as new
-    from ultralytics.data.augment import slice_geometry as old
-    for w, h in [(4000, 3000), (1280, 720), (800, 800)]:
-        for ov in [0.0, 0.2, 0.4]:
-            assert new(w, h, ov) == old(w, h, ov)
-    # bias paths
-    assert new(4000, 3000, 0.2, 0.1, -0.05) == old(4000, 3000, 0.2, 0.1, -0.05)
-
-
 def test_degrade_operators_shapes_and_types():
     from ultralytics_ooo.core import _apply_motion_blur, _apply_weather, _apply_occlusion, _ratio_pad_params
     rng = np.random.default_rng(0)
@@ -56,30 +51,14 @@ def test_degrade_operators_shapes_and_types():
     assert _ratio_pad_params(320, 240, "4:3", False) is None  # already 4:3
 
 
-def test_motion_blur_bit_identical_to_original():
-    from ultralytics_ooo.core import _apply_motion_blur as new
-    from ultralytics.data.online_degrade import _apply_motion_blur as old
-    rng = np.random.default_rng(1)
-    img = (rng.random((300, 400, 3)) * 255).astype(np.uint8)
-    np.random.seed(42)
-    a = new(img, length=22, angle=30, defocus_sigma=1.0, axis_aligned=False)
-    np.random.seed(42)
-    b = old(img, length=22, angle=30, defocus_sigma=1.0, axis_aligned=False)
-    assert np.array_equal(a, b)
-    np.random.seed(7)
-    a2 = new(img, length=10, angle=0, axis_aligned=True)
-    np.random.seed(7)
-    b2 = old(img, length=10, angle=0, axis_aligned=True)
-    assert np.array_equal(a2, b2)
-
-
-def test_cap_long_side_bit_identical():
-    from ultralytics_ooo.core import _cap_long_side as new
-    from ultralytics.data.base import _cap_long_side as old
+def test_cap_long_side_self_check():
+    from ultralytics_ooo.core import _cap_long_side
     rng = np.random.default_rng(2)
     img = (rng.random((3000, 4000, 3)) * 255).astype(np.uint8)
-    a, sa = new(img, 640)
-    b, sb = old(img, 640)
-    assert np.array_equal(a, b) and sa == sb
-    # cap <= 0 returns same object
-    assert new(img, 0)[1] == 1.0
+    out, scale = _cap_long_side(img, 640)
+    # long side caps at 640, aspect preserved
+    assert max(out.shape[:2]) == 640
+    assert out.shape[2] == 3 and out.dtype == img.dtype
+    # cap <= 0 returns same object / scale 1.0
+    same, s = _cap_long_side(img, 0)
+    assert s == 1.0

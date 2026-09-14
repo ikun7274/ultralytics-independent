@@ -1,6 +1,0 @@
-path: D:/Downloads/yolo_dataset
-train: images/train
-val: images/val
-test: images/test
-nc: 6
-names: ['Bus', 'Microbus', 'Minivan', 'Sedan', 'SUV', 'Truck']
