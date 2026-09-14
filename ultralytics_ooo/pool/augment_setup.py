@@ -42,6 +42,8 @@ from ultralytics_ooo.core import (
     _OCCLUSION_TYPES,
     slice_geometry,
     compute_slice_bias,
+    _ensure_dir,
+    _imwrite,
 )
 from ultralytics_ooo.pool.constants import _online_default
 
@@ -269,7 +271,7 @@ class OnlineSlice(BaseTransform):
                 cv2.putText(img, f"cls{int(c)}", (x0, max(0, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         # _ensure_dir: mkdir once per process instead of a syscall per saved tile per worker.
         _ensure_dir(self.save_dir)
-        if not imwrite(str(self.save_dir / f"{tag}_{self._saved:05d}_n{len(boxes_px)}.jpg"), img):
+        if not _imwrite(str(self.save_dir / f"{tag}_{self._saved:05d}_n{len(boxes_px)}.jpg"), img):
             # never consume the save_max quota (nor silently pass) when the write actually failed.
             LOGGER.warning(
                 f"OnlineSlice: tile save failed for '{self.save_dir}' (imwrite returned False) -- check "

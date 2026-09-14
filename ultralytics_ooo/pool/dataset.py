@@ -50,6 +50,18 @@ from ultralytics_ooo.pool.constants import (
 from ultralytics_ooo.pool.sampler import SegmentBases
 
 
+# Annotated-save branches accepted by _save_annotated, and the per-branch save-cap lookup.
+# Mirrored from the fork; slice_save_max_<branch> overrides the global slice_save_max (0 = unlimited).
+_SAVE_BRANCHES = {"blur", "weather", "occlusion", "ratio", "compose", "slice"}
+
+
+def _save_cap(self, branch: str) -> int:
+    v = getattr(self, f"slice_save_max_{branch}", _online_default(f"slice_save_max_{branch}"))
+    if v is None:
+        v = getattr(self, "slice_save_max", _online_default("slice_save_max"))
+    return int(v) if v is not None else 0
+
+
 class OnlinePoolDataset(BaseDataset):
     """BaseDataset subclass that adds the mixed virtual-sample pool.
 
