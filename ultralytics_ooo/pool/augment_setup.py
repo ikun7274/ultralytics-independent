@@ -9,9 +9,10 @@ dataset-property mirroring around them are new.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
-from ultralytics.utils import LOGGER
+from ultralytics.utils import LOGGER, DEFAULT_CFG_DICT
 from ultralytics.utils.instance import Instances
 from ultralytics.data.augment import (
     BaseTransform,
@@ -35,6 +36,19 @@ from ultralytics_ooo.core import (
 from ultralytics_ooo.pool.constants import _online_default
 
 _MISSING = object()
+
+
+def _compat(cls, *args, **kwargs):
+    """Instantiate ``cls`` on a pristine upstream Ultralytics, silently dropping kwargs the stock
+    class does not accept (fork-only debug knobs like save_dir/save_max; they never affect the
+    training math)."""
+    sig = inspect.signature(cls.__init__)
+    accepts_var = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    if not accepts_var:
+        kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return cls(*args, **kwargs)
+
+
 
 
 class OnlineSlice(BaseTransform):
@@ -523,11 +537,9 @@ def _hyp_get(hyp: Any, key: str, default: Any = _MISSING) -> Any:
         try:
             default = DEFAULT_CFG_DICT[key]
         except KeyError:
-            raise ValueError(
-                f"hyperparameter '{key}' is neither set on hyp nor registered in ultralytics/cfg/default.yaml. "
-                f"Add it to the default config (plus the matching CFG_*_KEYS list in ultralytics/cfg/__init__.py "
-                f"when it must be settable from the CLI). A stale local default.yaml produces this error too."
-            ) from None
+            # Online-augmentation key not present in the PRISTINE upstream default.yaml -> fall back to the
+            # package's own default table instead of hard-failing (the upstream default.yaml is left untouched).
+            default = _online_default(key)
     return getattr(hyp, key, default)
 
 
@@ -574,7 +586,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         >>> hyp.augmentations = augmentations
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
-    mosaic = Mosaic(
+    mosaic = _compat(Mosaic,
         dataset,
         imgsz=imgsz,
         p=hyp.mosaic,
@@ -583,7 +595,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         save_annotated=bool(_hyp_get(hyp, "mosaic_save_annotated")),
         exist_ok=bool(_hyp_get(hyp, "mosaic_save_exist_ok")),
     )
-    affine = RandomPerspective(
+    affine = _compat(RandomPerspective,
         degrees=hyp.degrees,
         translate=hyp.translate,
         scale=hyp.scale,
