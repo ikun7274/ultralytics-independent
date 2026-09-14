@@ -15,3 +15,7 @@ The public entry point is :func:`ultralytics_ooo.installer.install`.
 """
 
 __version__ = "0.1.0"
+
+from .installer import install
+
+__all__ = ["install"]
