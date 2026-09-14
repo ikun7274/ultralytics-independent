@@ -1505,3 +1505,34 @@ class OnlinePoolDataset(BaseDataset):
         """
         return self._segment_bases().total
 
+def patch_fraction_guard() -> None:
+    """Survive fraction rounding to zero on a tiny dataset.
+
+    Stock get_img_files does im_files[:round(len * fraction)]; on a tiny set that rounds to 0 and
+    leaves an empty dataset (later IndexError). When the stock result is empty and fraction<1, re-run
+    the lookup with fraction forced to 1.0 to keep at least the source image(s).
+    """
+    from ultralytics.data.base import BaseDataset
+    from ultralytics.utils import LOGGER
+
+    if getattr(BaseDataset, "_ooo_fraction_guard", False):
+        return
+    _orig = BaseDataset.get_img_files
+
+    def get_img_files(self, img_path):
+        files = _orig(self, img_path)
+        if self.fraction < 1 and len(files) == 0:
+            old = self.fraction
+            self.fraction = 1.0
+            try:
+                files = _orig(self, img_path)
+            finally:
+                self.fraction = old
+            LOGGER.warning(
+                f"ooo fraction guard: fraction={old} selected 0 images (rounded to zero); retained {len(files)} source image(s)."
+            )
+        return files
+
+    BaseDataset.get_img_files = get_img_files
+    BaseDataset._ooo_fraction_guard = True
+

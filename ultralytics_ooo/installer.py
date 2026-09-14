@@ -95,4 +95,9 @@ def install() -> None:
 
     patch_build_dataloader()
 
+    # Survive fraction rounding to zero on a tiny dataset.
+    from ultralytics_ooo.pool.dataset import patch_fraction_guard
+
+    patch_fraction_guard()
+
     _INSTALLED = True
