@@ -1,13 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-import os
 import shutil
-import sys
 from pathlib import Path
-
-# Make the project root (which holds the ``ultralytics_ooo`` package) importable when pytest runs
-# from any cwd. The pristine Ultralytics tree is expected on sys.path by the caller / cwd.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy.testing  # noqa: F401  # Pre-import before any test can corrupt numpy via in-place upgrade
 import pytest

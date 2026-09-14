@@ -28,7 +28,6 @@ share/python-wheels/
 MANIFEST
 requirements.txt
 !examples/**/requirements.txt
-!requirements.txt
 setup.py
 ultralytics.egg-info
 
@@ -55,8 +54,6 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-# Ruff 缓存目录（pytools/lint.py 用 --no-cache 跑，但 IDE / 手动执行会生成）
-.ruff_cache/
 mlruns/
 
 # Translations
@@ -214,18 +211,3 @@ results.csv
 fuzz-sources/
 fuzz-datasets/
 fuzz-models/
-
-# Temp / smoke-test artifacts (local debugging only)
-.bak_*/
-.workbuddy/
-_p23_smoke/
-_regress_runs/
-_smoke_runs/
-_smoke_*.py
-_final_smoke.py
-
-# YOLO label cache
-*.cache
-
-# Pristine upstream tree used only as a local comparison/validation base; not part of this repo.
-ultralytics-main/
