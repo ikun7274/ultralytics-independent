@@ -8,6 +8,11 @@ dataset.
 Note: on a stock Ultralytics the online slice/degrade augmentation is OFF by default
 (``slice_prob=0``), so until the augment-assembly layer (OnlineSlice / project-level v8_transforms
 overrides) is installed, behaviour is byte-for-byte upstream. That is the safe midpoint.
+
+The dataset subclass is defined at MODULE TOP LEVEL (not as a closure inside install()). Windows
+``spawn`` DataLoader workers unpickle it by re-importing this module and looking the name up there;
+a class defined inside install() never exists in a worker, which only runs main() and imports the
+package, so unpickling fails with "Can't get local object ...".
 """
 
 from __future__ import annotations
@@ -22,8 +27,7 @@ def install() -> None:
         return
 
     import ultralytics.data.build as _build
-    from ultralytics.data.dataset import YOLODataset
-    from ultralytics_ooo.pool.dataset import OnlinePoolDataset
+    from ultralytics_ooo.dataset_class import InstalledYOLODataset
 
     # Register the online hyperparameters onto the stock config namespace so model.train(slice_prob=...)
     # passes check_dict_alignment. get_cfg builds its base via cfg2dict(DEFAULT_CFG), so the keys must
@@ -36,11 +40,6 @@ def install() -> None:
         if not hasattr(DEFAULT_CFG, _k):
             setattr(DEFAULT_CFG, _k, _v)
         DEFAULT_CFG_DICT.setdefault(_k, _v)
-
-    # Cooperative subclass: OnlinePoolDataset's methods win the MRO; YOLODataset supplies get_labels
-    # and the stock build_transforms.
-    class InstalledYOLODataset(OnlinePoolDataset, YOLODataset):
-        """YOLODataset + the mixed virtual-sample pool, with no upstream edits."""
 
     # build_yolo_dataset references the module-level name `YOLODataset` at call time, so patching the
     # name in the build module redirects construction. (Depth/Semantic/MultiModal branches are untouched.)
@@ -85,5 +84,10 @@ def install() -> None:
     from ultralytics_ooo.pool.valslice import patch_validator
 
     patch_validator(DetectionValidator)
+
+    # Route the training dataloader through GroupedImageSampler when the pool is worth grouping.
+    from ultralytics_ooo.pool.sampler import patch_build_dataloader
+
+    patch_build_dataloader()
 
     _INSTALLED = True

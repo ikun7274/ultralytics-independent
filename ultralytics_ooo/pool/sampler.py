@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Iterator, NamedTuple
 
 import torch
@@ -64,3 +66,53 @@ class GroupedImageSampler(Sampler[int]):
                 for block in blocks:
                     if k < len(block):
                         yield block[k]
+
+
+def patch_build_dataloader() -> None:
+    """Redirect stock ``build_dataloader`` to use GroupedImageSampler on single-machine training.
+
+    When the dataset can be grouped (``slice_grouped_sampler`` on and the pool is worth grouping), we
+    build the loader ourselves with the grouped sampler in place of the built-in RandomSampler; every
+    other path (val, multi-GPU, grouping off) falls straight through to the stock implementation.
+    """
+    import ultralytics.data.build as _b
+
+    if getattr(_b, "_ooo_sampler_patched", False):
+        return
+    _orig = _b.build_dataloader
+
+    def patched(dataset, batch, workers, shuffle=True, rank=-1, drop_last=False, pin_memory=True, device="cuda"):
+        grouped = None
+        if rank == -1 and shuffle:
+            grouped = GroupedImageSampler.from_dataset(dataset)
+        if grouped is None:
+            return _orig(dataset, batch, workers, shuffle, rank, drop_last, pin_memory, device)
+
+        # Grouped sampler active: mirror the stock build_dataloader tail but pass sampler=grouped.
+        dataset_len = len(dataset)
+        batch = min(batch, dataset_len)
+        samples = len(grouped)
+        drop_last = drop_last and bool(batch) and dataset_len % batch != 0
+        batches = (samples // batch if drop_last else math.ceil(samples / batch)) if batch else 0
+        device_type = getattr(device, "type", str(device).split(":")[0])
+        nd = _b.get_torch_device_backend(device).device_count() if device_type not in {"cpu", "mps"} else 0
+        nw = min(os.cpu_count() // max(nd, 1), workers, 0 if batches <= 1 else batches)
+        generator = torch.Generator()
+        generator.manual_seed((6148914691236517205 + int(_b.RANK)) % (1 << 64))
+        pin_memory = nd > 0 and pin_memory
+        return _b.InfiniteDataLoader(
+            dataset=dataset,
+            batch_size=batch,
+            shuffle=False,  # sampler is supplied; stock requires shuffle=False when sampler is set
+            num_workers=nw,
+            sampler=grouped,
+            prefetch_factor=4 if nw > 0 else None,
+            pin_memory=pin_memory,
+            collate_fn=getattr(dataset, "collate_fn", None),
+            worker_init_fn=_b.seed_worker,
+            generator=generator,
+            drop_last=drop_last,
+        )
+
+    _b.build_dataloader = patched
+    _b._ooo_sampler_patched = True
