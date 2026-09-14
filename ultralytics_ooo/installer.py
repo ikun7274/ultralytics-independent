@@ -72,4 +72,12 @@ def install() -> None:
             ds.set_epoch(trainer.epoch, trainer.epochs)
 
     default_callbacks["on_train_epoch_start"].append(_ooo_set_epoch)
+
+    # Patch resume_extend_epochs onto the trainer (修补续训): repair ckpt metadata + rebuild LR schedule
+    # when resuming past the checkpoint's finished epoch count.
+    from ultralytics.engine.trainer import BaseTrainer
+    from ultralytics_ooo.pool.resume import patch_resume
+
+    patch_resume(BaseTrainer)
+
     _INSTALLED = True
