@@ -3505,7 +3505,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.slice_raw_cache_size = int(_hyp_get(hyp, "slice_raw_cache_size") or 0)
     # degradation resample kernel ("area" = antialiased/slower, "linear" = faster/slightly softer);
     # mirrored here because _degrade_frame reads it per-call from `self`.
-    dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "area")
+    dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "linear")
 
     # ---- 在线切片 (slice_prob 独立开关) ----
     slice_enabled = online_aug_on and _hyp_get(hyp, "slice_prob") > 0.0

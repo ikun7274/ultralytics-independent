@@ -97,7 +97,7 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     # working-resolution caps (0 = auto)
     "compose_max_side": 0,
     "degrade_max_side": 0,
-    "degrade_resample": "area",
+    "degrade_resample": "linear",
     # sampling / caching
     "slice_grouped_sampler": True,
     "slice_raw_cache_size": 2,
@@ -1553,7 +1553,7 @@ class BaseDataset(Dataset):
         # The cap itself lives in _cap_long_side so compose can apply the same rule. The kernel is
         # configurable (degrade_resample: "area" = antialiased/slower, "linear" = faster/softer);
         # geometry is identical either way, only the resampling filter differs.
-        resample = str(getattr(self, "degrade_resample", _online_default("degrade_resample")) or "area")
+        resample = str(getattr(self, "degrade_resample", _online_default("degrade_resample")) or "linear")
         interp = cv2.INTER_LINEAR if resample == "linear" else cv2.INTER_AREA
         return _cap_long_side(self._load_image_cached(img_index), self._degrade_max_side(), interp=interp)
 
