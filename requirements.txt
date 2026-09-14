@@ -18,7 +18,7 @@ ultralytics-thop>=2.7.0
 prettytable>=3.9.0
 
 polars>=0.20.0
-pi_heif>=0.13.0
+pi_heif>=1.4.0
 
 onnx>=1.16.0
 onnxruntime>=1.18.0
