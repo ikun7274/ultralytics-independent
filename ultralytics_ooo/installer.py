@@ -80,4 +80,10 @@ def install() -> None:
 
     patch_resume(BaseTrainer)
 
+    # Patch sliced validation (SAHI eval) onto DetectionValidator; off by default (val_slice_enable=False).
+    from ultralytics.models.yolo.detect.val import DetectionValidator
+    from ultralytics_ooo.pool.valslice import patch_validator
+
+    patch_validator(DetectionValidator)
+
     _INSTALLED = True
