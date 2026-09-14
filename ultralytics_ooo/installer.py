@@ -34,6 +34,13 @@ def install() -> None:
     # name in the build module redirects construction. (Depth/Semantic/MultiModal branches are untouched.)
     _build.YOLODataset = InstalledYOLODataset
 
+    # YOLODataset.build_transforms calls the module-level name `v8_transforms` imported from augment;
+    # swap it for the online-augment-aware version (installs OnlineSlice + mirrors the *_keep props).
+    import ultralytics.data.dataset as _ds
+    from ultralytics_ooo.pool.augment_setup import v8_transforms as _ooo_v8_transforms
+
+    _ds.v8_transforms = _ooo_v8_transforms
+
     # Publish set_epoch at every epoch start. default_callbacks is module-level and deepcopy'ed into
     # each new trainer, so appending here reaches every future trainer instance.
     from ultralytics.utils.callbacks.base import default_callbacks
