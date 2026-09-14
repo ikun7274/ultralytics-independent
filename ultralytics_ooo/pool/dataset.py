@@ -53,39 +53,12 @@ class OnlinePoolDataset(BaseDataset):
     the mirrored extension. ``installer`` swaps the trainer's dataset factory to this class.
     """
 
-    def __init__(
-        self,
-        img_path,
-        imgsz=640,
-        cache=False,
-        augment=True,
-        hyp=DEFAULT_CFG,
-        prefix="",
-        rect=False,
-        batch_size=16,
-        stride=32,
-        pad=0.5,
-        single_cls=False,
-        classes=None,
-        fraction=1.0,
-        channels=3,
-    ):
-        super().__init__(
-            img_path=img_path,
-            imgsz=imgsz,
-            cache=cache,
-            augment=augment,
-            hyp=hyp,
-            prefix=prefix,
-            rect=rect,
-            batch_size=batch_size,
-            stride=stride,
-            pad=pad,
-            single_cls=single_cls,
-            classes=classes,
-            fraction=fraction,
-            channels=channels,
-        )
+    def __init__(self, *args, **kwargs):
+        # Cooperative multiple-inheritance: forward every arg (img_path, hyp, data, task, ...) up the
+        # MRO to YOLODataset -> BaseDataset, then run the extension initialisation.
+        super().__init__(*args, **kwargs)
+        hyp = kwargs.get("hyp", DEFAULT_CFG)
+        fraction = kwargs.get("fraction", 1.0)
         # --- extension initialisation (mirrored from the forked BaseDataset.__init__) ---
         self.fraction = get_split_fraction(fraction, "train")
         # Mosaic buffer: a deque with an explicit maxlen gives O(1) eviction.
