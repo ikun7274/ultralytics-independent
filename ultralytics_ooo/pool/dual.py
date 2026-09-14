@@ -11,7 +11,42 @@ artifact for fair comparison against whole-image-only baselines. Implemented as 
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ultralytics.utils import LOGGER
+
+
+def _patch_plot_results():
+    """Wrapper stock plot_results so the extra ``whole_*`` columns don't break its even subplot layout.
+
+    Stock plot_results builds a 2-row grid from the loss/metric column count; the dual-metric pass adds
+    whole_* loss/metric columns, making the count odd and raising ``index out of bounds`` when it plots.
+    We strip whole_* columns into a temp CSV and plot that; the whole metrics still live in results.csv.
+    """
+    import ultralytics.engine.trainer as _t
+    if getattr(_t, "_ooo_plot_patched", False):
+        return
+    _orig = _t.plot_results
+
+    def _safe(file: str = "", dir: str = "", on_plot=None):
+        src = Path(file) if file else Path(dir) / "results.csv"
+        try:
+            if src.exists() and "whole_" in src.read_text(encoding="utf-8", errors="ignore"):
+                import tempfile
+                import polars as pl
+
+                df = pl.read_csv(src, infer_schema_length=None)
+                keep = [c for c in df.columns if not c.startswith("whole_")]
+                tmpdir = Path(tempfile.mkdtemp(prefix="ooo_plot_"))
+                tmp = tmpdir / "results.csv"
+                df.select(keep).write_csv(tmp)
+                return _orig(file=str(tmp), on_plot=on_plot)
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning(f"val_slice_dual_metric: plot wrapper fell back to stock ({e}).")
+        return _orig(file=file, dir=dir, on_plot=on_plot)
+
+    _t.plot_results = _safe
+    _t._ooo_plot_patched = True
 
 
 def _run_whole(self):
@@ -85,3 +120,4 @@ def patch_dual_metric(trainer_cls) -> None:
     trainer_cls.save_model = save_model
     trainer_cls._run_whole = _run_whole
     trainer_cls._ooo_dual_patched = True
+    _patch_plot_results()
