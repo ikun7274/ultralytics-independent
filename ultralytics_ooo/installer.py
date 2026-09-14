@@ -25,6 +25,18 @@ def install() -> None:
     from ultralytics.data.dataset import YOLODataset
     from ultralytics_ooo.pool.dataset import OnlinePoolDataset
 
+    # Register the online hyperparameters onto the stock config namespace so model.train(slice_prob=...)
+    # passes check_dict_alignment. get_cfg builds its base via cfg2dict(DEFAULT_CFG), so the keys must
+    # live on the DEFAULT_CFG SimpleNamespace itself (not only DEFAULT_CFG_DICT). We never edit upstream
+    # default.yaml; we only add missing attributes at runtime.
+    from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_DICT
+    from ultralytics_ooo.pool.constants import _ONLINE_DEFAULTS
+
+    for _k, _v in _ONLINE_DEFAULTS.items():
+        if not hasattr(DEFAULT_CFG, _k):
+            setattr(DEFAULT_CFG, _k, _v)
+        DEFAULT_CFG_DICT.setdefault(_k, _v)
+
     # Cooperative subclass: OnlinePoolDataset's methods win the MRO; YOLODataset supplies get_labels
     # and the stock build_transforms.
     class InstalledYOLODataset(OnlinePoolDataset, YOLODataset):
