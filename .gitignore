@@ -226,3 +226,6 @@ _final_smoke.py
 
 # YOLO label cache
 *.cache
+
+# Pristine upstream tree used only as a local comparison/validation base; not part of this repo.
+ultralytics-main/
