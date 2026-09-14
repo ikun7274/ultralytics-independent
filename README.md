@@ -1,9 +1,9 @@
-# ultralytics_ooo：Ultralytics 即插即用增强包
+# ultralytics_ooo：three online subsystem, Ultralytics 即插即用增强包
 
 > **一行 `install()`，不改上游任何源码，就把「在线数据增强 + 混合样本池 + 修补续训 + 切片验证 + 双口径 mAP」装进你现有的 Ultralytics 训练流程。**
 
-本仓库 = **干净 Ultralytics 8.4.126 原版** + **零侵入增强包 `ultralytics_ooo`**。
-这些能力原本是深度改进 Ultralytics 源码的（动 `data/base.py`、`data/augment.py`、`engine/trainer.py`、`detect/val.py`、`cfg/default.yaml`）；本项目把它们提取成独立包，用「子类化 + 运行时 monkey-patch」挂到干净原版上。
+本仓库 = **Ultralytics 8.4.126 原版** + **零侵入增强包 `ultralytics_ooo`**。
+这些能力原本是深度改进 Ultralytics 源码的（动 `data/base.py`、`data/augment.py`、`engine/trainer.py`、`detect/val.py`、`cfg/default.yaml`）；本项目把它们提取成独立包，用「子类化 + 运行时 monkey-patch」挂到干净原版上(深度改进：https://github.com/ikun7274/ultralytics-improved)。
 
 **即插即用意味着：**
 - ✅ **不修改上游源码**：所有改动发生在运行时对象上，不落盘；
