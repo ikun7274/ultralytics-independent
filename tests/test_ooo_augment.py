@@ -99,3 +99,78 @@ def test_mosaic_save_knobs_warn_that_they_are_inert(monkeypatch):
     assert len(warned) == 1, f"expected exactly one warning, got {len(warned)}: {records}"
     assert "mosaic_save_dir" in warned[0], warned[0]
     assert "slice_save_dir" in warned[0], warned[0]
+
+
+def test_slice_target_tiles_warns_when_it_cannot_choose_a_tile(monkeypatch):
+    """``slice_target_tiles`` only exists for ``slice_all_tiles=False``; the other two shapes must say so.
+
+    With ``all_tiles=True`` all four tiles are emitted anyway (the base segment is ``4*K_slice`` and the
+    tile comes from ``index % 4``), and with slicing off there is no base segment. Both used to be the
+    silent no-op class this package keeps hunting: a knob set to a non-default value that does nothing.
+    """
+    import logging
+
+    from ultralytics_ooo.pool import augment_setup as au
+
+    records = []
+
+    class _H(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    logger = logging.getLogger("ultralytics")
+
+    def ask(**kwargs):
+        records.clear()
+        monkeypatch.setattr(au, "_TARGET_TILES_WARNED", False)
+        logger.addHandler(_H())
+        try:
+            au._warn_if_target_tiles_are_inert(**kwargs)
+        finally:
+            logger.handlers.pop()
+
+    ask(slice_enabled=False, all_tiles=False, requested=True)  # slicing off -> inert
+    assert len(records) == 1 and "has no effect" in records[0], records
+    ask(slice_enabled=True, all_tiles=True, requested=True)  # all tiles already emitted -> inert
+    assert len(records) == 1 and "slice_all_tiles=True" in records[0], records
+    ask(slice_enabled=True, all_tiles=False, requested=True)  # the supported shape -> silent
+    assert not records, records
+    ask(slice_enabled=False, all_tiles=False, requested=False)  # knob off -> silent
+    assert not records, records
+
+
+def test_slice_at_prefer_target_substitutes_a_tile_that_keeps_the_target():
+    """The scheduler's map is built on the CENTERED grid; the live grid can disagree (``center_bias``).
+
+    ``slice_at(prefer_target=True)`` must therefore re-check its assigned tile against the live grid and
+    substitute the first tile that really keeps a target -- otherwise a scheduled "target tile" would
+    silently degrade into the empty-tile / Plan A fallback the scheduler exists to avoid.
+    """
+    import numpy as np
+
+    from ultralytics_ooo.pool.augment_setup import OnlineSlice
+
+    t = OnlineSlice(p=1.0, overlap_ratio=0.2, neg_ratio=-1)  # neg_ratio<0 -> every empty tile is emitted
+    img = np.zeros((96, 96, 3), dtype=np.uint8)
+    # ONE box pinned inside the top-left quadrant, so only tile 0 can keep it
+    label = {
+        "bboxes": np.array([[24.5 / 96, 24.5 / 96, 24 / 96, 24 / 96]], dtype=np.float32),
+        "bbox_format": "xywh", "normalized": True,
+        "cls": np.array([[0]]), "segments": [],
+    }
+    assert t.target_tiles(label, (96, 96), key=0) == [0]
+    assert t.target_tiles(label, (0, 0), key=0) == []  # degenerate shape -> no tile, no crash
+
+    # blind mode honours the caller's k verbatim: tile 1 keeps nothing
+    _sub, blind = t.slice_at(img, label, 1, key=0)
+    assert len(blind["bboxes"]) == 0
+
+    # prefer_target corrects it to the tile that does keep the target
+    sub, corrected = t.slice_at(img, label, 1, key=0, prefer_target=True)
+    assert len(corrected["bboxes"]) == 1, corrected["bboxes"]
+    assert sub.shape[0] < 96 and sub.shape[1] < 96, sub.shape
+
+    # ...and when NO tile keeps a target, k stands (the normal empty-tile rules still apply)
+    lab_none = dict(label, bboxes=np.empty((0, 4), dtype=np.float32), cls=np.empty((0, 1)))
+    _s, none_kept = t.slice_at(img, lab_none, 2, key=0, prefer_target=True)
+    assert len(none_kept["bboxes"]) == 0

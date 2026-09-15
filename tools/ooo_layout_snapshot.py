@@ -30,11 +30,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+# `python tools/<name>.py` puts `tools/` -- not the repo root -- on sys.path, and this project is not
+# necessarily pip-installed, so the lazy `from ultralytics.cfg import get_cfg` inside build() would fail
+# on a clean checkout. Put the root first so the invocation in this docstring actually works.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 SEG_ORDER = ["base", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
 RATIO_KEYS = ("slice_ratio", "ratio_pad_ratio", "blur_ratio", "compose_ratio", "weather_ratio",

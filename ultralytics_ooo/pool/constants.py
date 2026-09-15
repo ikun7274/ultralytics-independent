@@ -29,11 +29,25 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "slice_prob": 0.0,
     "slice_ratio": 1.0,
     "slice_all_tiles": False,
+    # slice_target_tiles: with slice_all_tiles=False the base segment holds ONE slot per selected item,
+    # and this knob turns that item into a target-bearing (image, tile) pair instead of a blind random
+    # tile. Each epoch takes the next block of K units from a fixed shuffled queue of every
+    # target-bearing tile, so no unit repeats until the whole queue has been used, then a fresh pass
+    # starts. See BaseDataset._target_tile_queue / _apply_target_tile_schedule.
+    "slice_target_tiles": False,
     "slice_overlap_ratio": 0.2,
     # img_origin: unified "put EVERY original image into the pool as one whole-frame slot" coverage
     # knob. Replaces the old slice_keep_origin (which only covered the SLICED images). With it on, every
     # image appears at least once per epoch; with it off, an image no augmentation branch selected is
     # simply absent from the pool (the "discard the un-selected" behaviour the ratio-sized layout enables).
+    #
+    # DEFAULT TRUE, and that default carries the zero-intrusion contract: with the knob off and no other
+    # online switch set, EVERY segment computes to 0, so len(dataset) == 0 -- which is not an empty but
+    # harmless dataset. build_dataloader opens with `batch = min(batch, len(dataset))`, so a 0-length
+    # train set rewrites its own batch size to 0 and torch raises "batch_size should be a positive
+    # integer value, but got batch_size=0" before epoch 1. Defaulting ON keeps an all-switches-off
+    # install inert (pool == N whole frames == the plain dataset), which is what lets the package sit on
+    # a pristine Ultralytics. See tests/test_ooo_branches.py::test_no_switches_means_no_expansion_at_all.
     "img_origin": True,
     "slice_min_tile_area_ratio": 0.005,
     "slice_min_box_retain_ratio": 0.4,

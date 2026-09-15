@@ -7,12 +7,17 @@ The slicing knobs are a three-layer decision chain, and two of the layers are in
                           Do NOT use 0 < p < 1 to "dial down" slicing: it coin-flips PER SLOT and the
                           losing slots fall back to the WHOLE image (the tool warns about it).
     slice_all_tiles       True  -> 4 slots per selected image (the base segment is 4K + N-K wide)
-                          False -> 1 random slot per selected image (base is N wide)
+                          False -> 1 slot per selected image (base is K wide)
     slice_ratio           per epoch, K = round(x * N) images take the slicing pipeline; the rest own
                           exactly ONE whole-frame slot each.
     slice_background_ratio  what an EMPTY tile becomes: kept as an empty tile while
                           ``empty <= x * positive`` (cumulative, per process, per epoch), otherwise
                           replaced by the WHOLE image. -1 keeps every empty tile.
+    slice_target_tiles    slice_all_tiles=False only: each slot holds a TILE THAT KEEPS A TARGET
+                          (image, tile) pair instead of a blind ``random.randrange(4)`` pick, consumed
+                          from a shuffled queue so no unit repeats until the queue is used up. The
+                          queue length printed below is how many such tiles the dataset HAS -- the
+                          number that decides the largest repeat-free ``slice_ratio`` (queue / N).
     img_origin           adds one whole frame per ORIGINAL image (unified coverage knob).
 
 Run this before tuning. It classifies every base/origin slot and prints the density, so you can see
@@ -31,6 +36,13 @@ from pathlib import Path
 
 import cv2
 import yaml
+
+# `python tools/<name>.py` puts `tools/` -- not the repo root -- on sys.path, and this project is not
+# necessarily pip-installed, so the lazy `from ultralytics.cfg import get_cfg` inside build() fails on a
+# clean checkout. Put the root first so the invocation in this docstring actually works.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 RATIO_KEYS = ("slice_ratio",)
 
@@ -59,10 +71,10 @@ def build(train_dir: Path, data: dict, args, **over):
     from ultralytics_ooo import install
 
     install()
-    cfg_in = dict(task="detect", mode="train", imgsz=args.imgsz, batch=args.batch, fraction=1.0,
-                  workers=0, slice_prob=args.prob, slice_all_tiles=args.all_tiles,
-                  slice_ratio=args.ratio, img_origin=args.img_origin,
-                  slice_background_ratio=args.bg)
+    cfg_in = {"task": "detect", "mode": "train", "imgsz": args.imgsz, "batch": args.batch, "fraction": 1.0,
+              "workers": 0, "slice_prob": args.prob, "slice_all_tiles": args.all_tiles,
+              "slice_ratio": args.ratio, "img_origin": args.img_origin,
+              "slice_background_ratio": args.bg, "slice_target_tiles": args.target_tiles}
     cfg_in.update(over)
     cfg = get_cfg(overrides=cfg_in)
     return build_yolo_dataset(cfg, str(train_dir), args.batch, data, mode="train")
@@ -93,6 +105,10 @@ def classify(ds) -> dict:
         else:
             out["pos"] += 1
     out.update(lens=lens, total=len(ds), k_slice=len(ds._sel_indices("slice", len(ds.labels))))
+    # How many target-bearing (image, tile) pairs the dataset has: with slice_target_tiles this is the
+    # queue that gets consumed K units per epoch, so it also bounds the repeat-free slice_ratio.
+    out["queue"] = len(ds._target_tile_queue()) if ds._slice_on() else 0
+    out["units"] = len(ds._tile_units) if getattr(ds, "_tile_units", None) is not None else 0
     return out
 
 
@@ -103,6 +119,11 @@ def report(tag: str, r: dict, n_images: int) -> None:
           f"K_slice={r['k_slice']:>4}/{n_images}")
     print(f"{'':<26} slots={slots:>6}  positive={r['pos']:>5} ({pos_share:5.1%})  "
           f"empty={r['empty']:>5}  whole={r['whole']:>5}")
+    if r["queue"]:
+        ratio_free = r["queue"] / n_images if n_images else 0.0
+        sched = f"{r['units']} scheduled this epoch" if r["units"] else "schedule OFF"
+        print(f"{'':<26} target-bearing tiles={r['queue']:>5}  ({sched}; repeat-free slice_ratio <= "
+              f"{ratio_free:.4g})")
 
 
 def _probability(text: str) -> bool | float:
@@ -126,6 +147,9 @@ def main(argv=None) -> int:
     ap.add_argument("--bg", type=float, default=-1.0, help="slice_background_ratio")
     ap.add_argument("--all-tiles", dest="all_tiles", action="store_true", default=True)
     ap.add_argument("--one-tile", dest="all_tiles", action="store_false")
+    ap.add_argument("--target-tiles", dest="target_tiles", action="store_true", default=False,
+                    help="slice_target_tiles: bind each slot to a tile that KEEPS a target "
+                         "(slice_all_tiles=False only)")
     ap.add_argument("--img-origin", dest="img_origin", action="store_true",
                     help="img_origin: put one whole-frame slot per ORIGINAL image into the pool (unified coverage)")
     ap.add_argument("--grid", action="store_true", help="also sweep bg over -1 / 0.2 / 0")
@@ -140,7 +164,7 @@ def main(argv=None) -> int:
 
     print(f"dataset: {data_yaml}  ({train_dir})  N={n_images} images, imgsz={args.imgsz}\n")
     tag = (f"prob={args.prob:g} all_tiles={args.all_tiles} ratio={args.ratio:g} "
-           f"bg={args.bg:g} img_origin={args.img_origin}")
+           f"bg={args.bg:g} target_tiles={args.target_tiles} img_origin={args.img_origin}")
     report(tag, classify(build(train_dir, data, args)), n_images)
 
     if args.grid:
@@ -155,6 +179,8 @@ def main(argv=None) -> int:
     print("  * empty tiles are pure negatives (useful only if false positives are your problem).")
     print("  * 'whole' counts slots holding the ORIGINAL frame: those come from un-selected images (ratio<1),")
     print("    from img_origin, and from empty tiles the bg quota replaced. B+ removed the first kind only.")
+    print("  * target-bearing tiles is the slice_target_tiles queue. With --one-tile it is the ceiling on")
+    print("    distinct positive slots, so a repeat-free run needs slice_ratio <= queue / N.")
     return 0
 
 

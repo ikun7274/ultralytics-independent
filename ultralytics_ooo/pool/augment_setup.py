@@ -57,6 +57,29 @@ def _compat(cls, *args, **kwargs):
 
 # Once-per-process latch for the "mosaic_save_* does nothing on stock Ultralytics" warning.
 _MOSAIC_SAVE_WARNED = False
+_TARGET_TILES_WARNED = False
+
+
+def _warn_if_target_tiles_are_inert(slice_enabled: bool, all_tiles: bool, requested: bool) -> None:
+    """Tell the user, once, when ``slice_target_tiles`` cannot do anything in this configuration.
+
+    The scheduler only exists for the ``slice_all_tiles=False`` structure: with ``all_tiles=True`` all
+    four tiles are emitted anyway, so there is no tile to choose between (the base segment is
+    ``4*K_slice`` and the tile index comes from ``index % 4``). With slicing off there is no base
+    segment at all. Both cases used to be the silent no-op class this package keeps warning about:
+    a knob set to a non-default value that changes nothing.
+    """
+    global _TARGET_TILES_WARNED
+    if _TARGET_TILES_WARNED or not requested:
+        return
+    if slice_enabled and not all_tiles:
+        return
+    _TARGET_TILES_WARNED = True
+    because = "slice_all_tiles=True emits all 4 tiles already" if slice_enabled else "slicing is off"
+    LOGGER.warning(
+        f"slice_target_tiles=True has no effect here: {because}, so no tile is ever chosen. "
+        "It only applies with slice_prob>0 and slice_all_tiles=False."
+    )
 
 
 def _warn_mosaic_save_is_a_noop(hyp) -> None:
@@ -444,6 +467,34 @@ class OnlineSlice(BaseTransform):
                 tile_results.append((x0, y0, x1, y1, idx, local))
         return tile_results
 
+    def target_tiles(self, label: dict[str, Any], shape: Any, key: Any = None) -> list[int]:
+        """Return the tile indices (0..3) whose box filter keeps at least ONE target for this label.
+
+        This is the query the target-tile scheduler in ``BaseDataset`` needs, and it deliberately runs
+        the SAME ``_geometry`` the emit path runs, so "which tile holds a target" can never drift from
+        "which tile ends up holding a target" (min_area_ratio / min_retain_ratio / center_constraint /
+        full_box_only all included). Re-deriving the box->tile maths here would be a second
+        implementation of the project's most filter-heavy function.
+
+        ``shape`` is ``(h, w)`` -- ONLY the image's shape is read, so a caller that must not pay for a
+        decode (the per-epoch scheduling pass reads thousands of labels) can pass the shape cached in
+        ``labels.cache`` instead of an image. The stand-in is a zero-stride broadcast view: real
+        ``ndarray``, right ``.shape``, no memory.
+
+        Assumes the CENTERED grid: with ``center_bias`` the seam moves per (epoch, image), so a
+        scheduled tile can come out empty on the live grid -- ``slice_at(prefer_target=True)``
+        re-checks against the actual grid and substitutes, which is why this can stay decode-free.
+
+        Returns:
+            (list[int]): Sorted tile indices keeping >= 1 target; ``[]`` when the label has no box or
+                no tile retains one.
+        """
+        h, w = int(shape[0]), int(shape[1])
+        if h < 2 or w < 2:
+            return []
+        stub = np.broadcast_to(np.zeros((1, 1, 3), dtype=np.uint8), (h, w, 3))
+        return [k for k, t in enumerate(self._geometry(stub, label, key, only=None)) if len(t[4]) > 0]
+
     def _empty_label(self, sub: np.ndarray, label: dict[str, Any]) -> dict[str, Any]:
         """Build a label dict for an empty (background) tile: same structure as the input, zero boxes/cls."""
         new_label = dict(label)
@@ -549,7 +600,8 @@ class OnlineSlice(BaseTransform):
         return self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
 
     def slice_at(self, img: np.ndarray, label: dict[str, Any], k: int,
-                 src: Any = None, count: bool = True, key: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
+                 src: Any = None, count: bool = True, key: Any = None,
+                 prefer_target: bool = False) -> tuple[np.ndarray, dict[str, Any]]:
         """Return the ``k``-th (0..3) tile so all 4 tiles participate in training (mode B / emit_all).
 
         Background-quota-exceeded tiles fall back to the ORIGINAL image (Plan A), never to an empty
@@ -561,13 +613,30 @@ class OnlineSlice(BaseTransform):
             count (bool): Whether to update counters/save (False for auxiliary mix samples).
             key (Any): Original image index -- the SAME value for k=0..3 of one image. It is what makes
                 the 4 tiles share one grid; do NOT pass ``(img_index, k)`` here.
+            prefer_target (bool): ``k`` came from the target-tile scheduler (``slice_target_tiles``,
+                ``slice_all_tiles=False``), i.e. it was chosen so this slot carries a target. The
+                scheduler's map is built on the CENTERED grid (decode-free, see ``target_tiles``), so
+                when ``center_bias`` jitters the seam the assigned tile can come out empty here. In
+                that case -- and only then -- substitute the first tile of the LIVE grid that does keep
+                a target. No global-RNG draw is consumed on either path, so the substitution is
+                deterministic and cannot shift downstream augmentation decisions.
         """
         if random.uniform(0, 1) > self.p:
             return img, label
         if img.shape[1] < 2 or img.shape[0] < 2:
             return img, label
-        # only=k: this call is handed the tile it must return, so there is no reason to build the other three.
-        x0, y0, x1, y1, idx, local = self._geometry(img, label, key, only=k)[0]
+        if prefer_target:
+            # All four tiles are needed to answer "which one keeps a target" against the live grid, and
+            # the chosen one is then emitted without recomputing it -- so this costs one grid build, not
+            # four. An image whose label keeps no target anywhere leaves ``keep`` empty and ``k`` stands,
+            # which hands it to the normal empty-tile / Plan A rules below.
+            tiles = self._geometry(img, label, key, only=None)
+            keep = [i for i, t in enumerate(tiles) if len(t[4]) > 0]
+            chosen = tiles[k if (k in keep or not keep) else keep[0]]
+        else:
+            # only=k: this call is handed the tile it must return, so there is no reason to build the other three.
+            chosen = self._geometry(img, label, key, only=k)[0]
+        x0, y0, x1, y1, idx, local = chosen
         sub, out_label = self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
         # Plan A fallback: when this tile is empty AND the background quota is reached, _emit returns
         # the ORIGINAL image unchanged (mode A contract). We keep that original image as-is -- bbox
@@ -792,10 +861,14 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         )
         dataset.slice_all_tiles = bool(_hyp_get(hyp, "slice_all_tiles"))
         dataset.slice_ratio = float(_hyp_get(hyp, "slice_ratio"))
+        dataset.slice_target_tiles = bool(_hyp_get(hyp, "slice_target_tiles"))
+        _warn_if_target_tiles_are_inert(True, dataset.slice_all_tiles, dataset.slice_target_tiles)
     else:
         dataset.slice_transform = None
         dataset.slice_all_tiles = False
         dataset.slice_ratio = 1.0
+        dataset.slice_target_tiles = False
+        _warn_if_target_tiles_are_inert(False, False, bool(_hyp_get(hyp, "slice_target_tiles")))
 
     # ---- 统一原图覆盖开关 (img_origin): 取代 slice_keep_origin ----
     # img_origin=True 把每张原图作为 1 个整图槽放入样本池, 是"未选中原图"的统一覆盖机制; 关闭时未被

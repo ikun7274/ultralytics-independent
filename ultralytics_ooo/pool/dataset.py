@@ -126,6 +126,18 @@ class OnlinePoolDataset(BaseDataset):
         # True inside close_aug_epoch's window: the line-up keeps its shape but every branch builder
         # emits the plain original instead of its transform (see _rebuild_epoch_masks).
         self._closing = False
+        # Target-tile schedule (slice_target_tiles, slice_all_tiles=False only): ``_tile_units`` is this
+        # epoch's list of (image, tile) pairs -- one per BASE slot -- with the pairs drawn from
+        # ``_target_tile_queue_cache``. ``None`` means "the schedule is not in use this epoch", and the
+        # base segment then maps slots to images with a blind random tile exactly as before. Both are
+        # rebuilt in every process that rebuilds the masks (main via set_epoch, workers via
+        # _sync_epoch_masks) from the same seed, so they never need transporting (see
+        # _apply_target_tile_schedule).
+        self._tile_units: list[tuple[int, int]] | None = None
+        self._target_tile_queue_cache: list[tuple[int, int]] | None = None
+        self._target_tile_pass_cache: tuple[int, list[tuple[int, int]]] | None = None
+        self._target_tile_warned = False
+        self._target_tile_empty_warned = False
         try:
             self._mp_epoch = multiprocessing.Value("i", -1)
             self._mp_epochs = multiprocessing.Value("i", -1)
@@ -385,6 +397,11 @@ class OnlinePoolDataset(BaseDataset):
             else:
                 # ratio >= 1 (or negative) -> every slot is augmented.
                 setattr(self, f"_sel_{attr}", None)
+        # Runs AFTER the table above because it REPLACES the slice branch's image-level draw with a
+        # tile-level schedule (see _apply_target_tile_schedule). It draws from its own seed, so the
+        # table's shared ``rng`` sequence -- and therefore every other branch's selection -- is
+        # byte-identical whether or not this knob is on.
+        self._apply_target_tile_schedule(epoch, n)
 
     def _warn_negative_ratio(self, attr: str, ratio_attr: str, x: float) -> None:
         """Warn ONCE per branch for a negative ``*_ratio``, which silently means "100%".
@@ -456,6 +473,17 @@ class OnlinePoolDataset(BaseDataset):
                 if not sel and not closing:  # during close_aug_epoch a zero is intentional
                     part += "  <-- NONE"
                 parts.append(part)
+        # With the target-tile schedule on, the "slice" line above counts (image, tile) UNITS rather than
+        # images. Which pass/block this epoch is cannot be inferred from the config, and "why am I seeing
+        # this tile again" is otherwise unanswerable from the log -- so print it.
+        if self._tile_units is not None:
+            queue = self._target_tile_queue()
+            n_blocks = max(1, -(-len(queue) // max(1, len(self._tile_units))))
+            pass_idx, block = divmod(int(epoch), n_blocks)
+            parts.append(
+                f"target tiles: {len(self._tile_units)} units of {len(queue)} "
+                f"(block {block + 1}/{n_blocks}, pass {pass_idx + 1})"
+            )
         if not parts:
             return
         head = f"augment masks @ epoch {epoch}"
@@ -527,6 +555,12 @@ class OnlinePoolDataset(BaseDataset):
 
     def _has_partial_ratio(self) -> bool:
         """True when at least one enabled branch has a ratio in ``[0, 1)`` -- i.e. it needs a draw."""
+        # The target-tile schedule moves to a NEW block every epoch even when slice_ratio >= 1 (K == N),
+        # so a dataset driven without a trainer still has to publish an epoch before its base slots are
+        # meaningful. Without this the "all slots" sentinel would stand in for a schedule that is
+        # supposed to advance, and every epoch would emit the same first block.
+        if self._target_tile_schedule_on():
+            return True
         n = len(self.labels)
         for _attr, ratio_attr, on, _count in self._mask_specs(n):
             if not on:
@@ -535,6 +569,136 @@ class OnlinePoolDataset(BaseDataset):
             if 0.0 <= x < 1.0:
                 return True
         return False
+
+    def _target_tile_schedule_on(self) -> bool:
+        """True when this dataset should schedule BASE slots as target-bearing (image, tile) pairs.
+
+        All three conditions are structural, not preferences: the knob has to be on, slicing has to be
+        the owner of the base segment, and the base segment has to hold exactly ONE slot per item
+        (``slice_all_tiles=False``). With ``all_tiles=True`` the segment is ``4*K_slice`` and every tile
+        of every selected image is emitted, so there is no tile to choose -- ``v8_transforms`` warns
+        once when the knob is set in that shape.
+        """
+        if not bool(getattr(self, "slice_target_tiles", _online_default("slice_target_tiles"))):
+            return False
+        return self._slice_on() and self._n_per() == 1
+
+    def _target_tile_queue(self) -> list[tuple[int, int]]:
+        """Every ``(image, tile)`` pair that keeps at least one target, in a fixed shuffled order.
+
+        The scheduling UNIT is the tile, not the image, because with ``slice_all_tiles=False`` a base
+        slot emits exactly one tile: queuing target-bearing tiles is what makes those slots positive,
+        and it is also what makes "every target-bearing tile gets its turn" expressible at all. An
+        image with several targets may contribute several units (and one with none contributes zero --
+        a background image has no tile worth slicing, so it reaches training through the origin segment
+        or whichever augmentation branch selects it).
+
+        Built WITHOUT decoding any image: the tile filter needs only ``(h, w)`` and the boxes, both of
+        which ``labels.cache`` already holds, and ``OnlineSlice.target_tiles`` runs the very same
+        ``_geometry`` the emit path runs. One pass over the label cache, once per process, then cached
+        for the whole run -- the order cannot change mid-run or the "no repeats" property would break.
+
+        The shuffle is seeded from ``_mask_seed`` (the dataset's file list) for the same reason every
+        other draw is: the main process and every worker must arrive at the identical order with no
+        cross-process transport.
+        """
+        cached = self._target_tile_queue_cache
+        if cached is not None:
+            return cached
+        st = getattr(self, "slice_transform", None)
+        units: list[tuple[int, int]] = []
+        if st is not None:
+            for i, label in enumerate(self.labels):
+                boxes = label.get("bboxes")
+                if boxes is None or len(np.asarray(boxes)) == 0:
+                    continue
+                shape = label.get("shape") or label.get("ori_shape")
+                if shape is None:
+                    continue
+                units.extend((i, k) for k in st.target_tiles(label, shape, key=i))
+        random.Random(f"{self._mask_seed}:target_tiles").shuffle(units)
+        self._target_tile_queue_cache = units
+        return units
+
+    def _target_tile_pass(self, pass_idx: int) -> list[tuple[int, int]]:
+        """The queue reshuffled for pass ``pass_idx`` -- one full sweep of every target-bearing tile.
+
+        Re-shuffling per pass (instead of reusing one fixed order for the whole run) is what makes the
+        restart the user asked for a genuine new round: after the queue is exhausted the next pass
+        visits the same units in a different order, so an image is not always paired with the same
+        neighbours. Seeded by ``(mask_seed, pass_idx)`` so it stays recomputable in every process.
+        """
+        cached = self._target_tile_pass_cache
+        if cached is not None and cached[0] == pass_idx:
+            return cached[1]
+        perm = list(self._target_tile_queue())
+        random.Random(f"{self._mask_seed}:target_tiles:pass{int(pass_idx)}").shuffle(perm)
+        self._target_tile_pass_cache = (int(pass_idx), perm)
+        return perm
+
+    def _apply_target_tile_schedule(self, epoch: int, n: int) -> None:
+        """Publish this epoch's BASE slots as target-bearing tiles (see ``slice_target_tiles``).
+
+        The layout is untouched: ``base = _ratio_K('slice_ratio', n)`` in every configuration, and this
+        only decides WHICH (image, tile) pair each of those slots holds. That is why ``len(dataset)``
+        still cannot move and the mosaic buffer / sampler units stay valid.
+
+        Scheduling: the queue is cut into consecutive blocks of ``K`` and one block is consumed per
+        epoch, so no unit repeats until every unit has been used -- which is the "do not re-pick last
+        epoch's tile" requirement -- and when the queue runs out the next PASS starts from a freshly
+        shuffled order ("restart"). Block index and pass index are pure functions of the epoch, so
+        workers rebuilding epoch ``e`` derive exactly this schedule with no transport. No global RNG is
+        touched, so enabling the knob does NOT shift any other branch's selection.
+
+        When ``K`` does not divide the queue length the final block of a pass wraps around to units
+        already seen earlier in that same pass (they are the least recently used, which is the best
+        available choice), and when ``K`` exceeds the queue length a unit necessarily repeats inside one
+        epoch -- warned once, because that silently lowers variety rather than merely sharing it.
+        """
+        on = self._target_tile_schedule_on() and not self._closing
+        if not on:
+            self._tile_units = None
+            return
+        k_slice = self._ratio_K("slice_ratio", n, self._slice_on())
+        queue = self._target_tile_queue()
+        if k_slice <= 0:
+            self._tile_units = None
+            return
+        if not queue:
+            # No image in this dataset keeps a box in any tile (all-background dataset, empty label
+            # files, or a filter combination that drops every box). Fall back to the blind-random base
+            # segment instead of publishing a schedule that cannot be filled, and say so once.
+            self._tile_units = None
+            self._warn_target_tiles_unusable(
+                "no (image, tile) pair in this dataset keeps a target, so there is nothing to schedule"
+            )
+            return
+        n_blocks = max(1, -(-len(queue) // k_slice))  # ceil, i.e. blocks needed for one full pass
+        if k_slice > len(queue) and not self._target_tile_warned:
+            self._target_tile_warned = True
+            LOGGER.warning(
+                f"{self.prefix}slice_target_tiles: slice_ratio selects {k_slice} slots but the dataset "
+                f"has only {len(queue)} target-bearing tiles, so units REPEAT inside one epoch "
+                f"({k_slice / len(queue):.2f}x per epoch). Lower slice_ratio to <= "
+                f"{len(queue) / max(n, 1):.4g} to give every slot a distinct tile."
+            )
+        pass_idx, block = divmod(int(epoch), n_blocks)
+        perm = self._target_tile_pass(pass_idx)
+        base = (block * k_slice) % len(queue)
+        self._tile_units = [perm[(base + j) % len(queue)] for j in range(k_slice)]
+        # Keep `_sel_indices("slice")` truthful: it is the base segment's "which image owns slot i" map
+        # (grouped_sample_units reads it that way), and the schedule REPLACES the image-level draw.
+        self._sel_slice = [img for img, _k in self._tile_units]
+
+    def _warn_target_tiles_unusable(self, detail: str) -> None:
+        """Warn ONCE when ``slice_target_tiles`` is set but the schedule cannot be built."""
+        if self._target_tile_empty_warned:
+            return
+        self._target_tile_empty_warned = True
+        LOGGER.warning(
+            f"{self.prefix}slice_target_tiles=True but {detail}; falling back to one blind random tile "
+            "per selected image (the slice_all_tiles=False behaviour)."
+        )
 
     def _ensure_epoch_sel(self) -> None:
         """Draw this epoch's selections if nothing has published an epoch yet (main process only).
@@ -562,13 +726,25 @@ class OnlinePoolDataset(BaseDataset):
         owns ``n_per`` CONSECUTIVE slots (so ``index // n_per`` is its position in the selection and
         ``index % n_per`` its tile, exactly the pre-refactor arithmetic). There is NO plain tail: an
         un-selected image owns no base slot at all -- it only appears via the IMG_ORIGIN segment (if on)
-        or via whatever augmentation branch selected it. With ``n_per == 1`` (``slice_all_tiles`` off, or
-        slicing off) the base segment is empty and this is never reached for a valid index.
+        or via whatever augmentation branch selected it. Slicing off gives ``K_slice == 0``, i.e. an
+        empty base segment, so this is never reached for a valid index; ``slice_all_tiles=False`` does
+        NOT empty it (that shape is ``K_slice`` slots wide, one per selected image).
+
+        With the target-tile schedule on (``slice_target_tiles``), the ``n_per == 1`` case takes its
+        (image, tile) pair from ``_tile_units`` instead: the tile is then already decided and the
+        transform is handed it, rather than picking one at random.
         """
         n_per = self._n_per()
         sel = self._sel_indices("slice", len(self.labels))
         if n_per > 1:
             return sel[index // n_per], index % n_per, True
+        units = self._tile_units
+        if units is not None:
+            # Target-tile schedule: the slot already knows its tile (see _apply_target_tile_schedule).
+            # ``_sel_indices("slice")`` is kept in sync with these units, but the tile is only available
+            # here -- which is the whole point of the schedule.
+            img, k = units[index]
+            return int(img), int(k), True
         return sel[index], None, True
 
     def _sync_epoch_masks(self) -> None:
@@ -1767,6 +1943,16 @@ class OnlinePoolDataset(BaseDataset):
                 Auxiliary "mix" samples requested by Mosaic/CutMix/MixUp pass ``False`` so they slice normally
                 but do not inflate the ``neg_ratio`` quota or duplicate saved slices.
         """
+        # --- non-augmenting build (mode="val"): no pool exists, so index -> image, exactly upstream ---
+        # Upstream's YOLODataset.build_transforms returns a bare val transform when augment=False, so
+        # v8_transforms never runs and NONE of slice_transform / img_origin / *_keep are mirrored onto
+        # this object. Every segment of the layout therefore resolves to 0 and an index here is a plain
+        # image index -- not a pool slot. Running the dispatch below anyway would misread it as a base
+        # slot of an empty layout and index past the end of every (empty) selection array.
+        # BaseDataset.get_image_and_label is the correct answer for val, including the rect
+        # batch_shapes lookup val relies on, so delegate rather than re-implement.
+        if not self.augment:
+            return super().get_image_and_label(index)
         # pick up the trainer's latest set_epoch publish. No-op (one locked int read) in the
         # main process and whenever the epoch is unchanged; in a DataLoader worker with a stale
         # selection this deterministically rebuilds it for the published epoch.
@@ -1849,11 +2035,18 @@ class OnlinePoolDataset(BaseDataset):
             # exactly that case. With the LRU disabled nothing is cached, the array is already
             # exclusive, and the guard is skipped.
             shared = self._load_image_cached(img_index, copy=False)
-            im, label = (
-                slice_t.slice_at(shared, label, k, src=(img_index, k), count=count_slice, key=img_index)
-                if emit_all
-                else slice_t(shared, label, src=img_index, count=count_slice, key=img_index)
-            )
+            # A scheduled tile (slice_target_tiles) arrives exactly like an emit_all tile: the tile is
+            # already decided, so slice_at is the right entry point and prefer_target lets it re-check
+            # the choice against the LIVE grid when center_bias moved the seam. ``emit_all`` never sets
+            # prefer_target -- there all four tiles are emitted, so there is nothing to correct.
+            if emit_all or k is not None:
+                tile_k = 0 if k is None else int(k)
+                im, label = slice_t.slice_at(
+                    shared, label, tile_k, src=(img_index, tile_k), count=count_slice,
+                    key=img_index, prefer_target=(not emit_all),
+                )
+            else:
+                im, label = slice_t(shared, label, src=img_index, count=count_slice, key=img_index)
             if self._raw_cache_size > 0 and im is shared:
                 im = im.copy()
             # reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
@@ -1890,6 +2083,18 @@ class OnlinePoolDataset(BaseDataset):
         it from the same per-segment lengths as every boundary. The accumulation used to be
         re-implemented here; adding a new branch and missing this copy would desynchronise
         ``len(dataset)`` from the decodable index range and silently drop samples.
+
+        A non-augmenting build (``mode="val"``) has no pool and delegates to upstream. Validation is not
+        a training surface: ``v8_transforms`` never runs there (see ``get_image_and_label``), so every
+        segment is 0 and the pool answer would be 0 -- and 0 is not a harmless empty val set.
+        ``build_dataloader`` starts with ``batch = min(batch, len(dataset))``, so a 0-length val dataset
+        rewrites its own batch size to 0 and torch raises ``ValueError: batch_size should be a positive
+        integer value, but got batch_size=0`` from inside ``_build_train_pipeline`` -- training dies
+        before epoch 1, with a traceback that points nowhere near the pool and no mention of img_origin
+        or slice_prob. That is exactly the trap ``img_origin=False`` (the default) sprang on every
+        train run whose val split is non-empty. Delegating keeps val byte-for-byte upstream.
         """
+        if not self.augment:
+            return super().__len__()
         return self._segment_bases().total
 

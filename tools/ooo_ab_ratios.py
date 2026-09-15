@@ -40,6 +40,13 @@ import logging
 import sys
 from pathlib import Path
 
+# `python tools/<name>.py` puts `tools/` -- not the repo root -- on sys.path, and this project is not
+# necessarily pip-installed, so the lazy `from ultralytics.cfg import get_cfg` inside build() would fail
+# on a clean checkout. Put the root first so the invocation in this docstring actually works.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 RATIO_KEYS = ("ratio_pad_ratio", "blur_ratio", "compose_ratio")
 
 
