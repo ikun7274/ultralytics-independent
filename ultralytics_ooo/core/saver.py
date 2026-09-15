@@ -49,12 +49,3 @@ def _imwrite(path, img) -> bool:
         _forget_dir(Path(path).parent)
         return False
     return True
-
-
-def _save_cap(dataset, branch: str) -> int:
-    """Return the per-branch save cap. ``slice_save_max_<branch>`` overrides the global ``slice_save_max``;
-    a missing or ``None`` attribute falls back to ``slice_save_max``. ``0`` means unlimited."""
-    val = getattr(dataset, f"slice_save_max_{branch}", None)
-    if val is None:
-        val = getattr(dataset, "slice_save_max", 0) or 0
-    return int(val)

@@ -64,6 +64,7 @@ def test_finished_read_from_train_args_and_rewrites():
     ckpt = {"epoch": -1, "train_args": {"epochs": 4, "patience": 100}}
     trainer = _make_trainer(ckpt, extend=7)
     ft, called = _run_resume(trainer, ckpt)
+    assert called["orig"] is True, "the patched resume_training must still delegate to the original"
     # index repaired from -1 back to finished-1 == 3
     assert ckpt["epoch"] == 3
     # ckpt metadata rewritten to the new total

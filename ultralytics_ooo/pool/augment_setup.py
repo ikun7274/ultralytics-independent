@@ -10,40 +10,34 @@ dataset-property mirroring around them are new.
 from __future__ import annotations
 
 import inspect
-import math
 import os
 import random
-import time
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
-import torch
 
-
-from ultralytics.utils import LOGGER, DEFAULT_CFG_DICT
-from ultralytics.utils.instance import Instances
 from ultralytics.data.augment import (
+    Albumentations,
     BaseTransform,
-    Mosaic,
-    RandomPerspective,
     Compose,
     CopyPaste,
-    MixUp,
     CutMix,
-    Albumentations,
-    RandomHSV,
+    MixUp,
+    Mosaic,
     RandomFlip,
+    RandomHSV,
+    RandomPerspective,
 )
-from ultralytics.utils import IterableSimpleNamespace
+from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, IterableSimpleNamespace
 from ultralytics_ooo.core import (
-    _WEATHER_TYPES,
     _OCCLUSION_TYPES,
-    slice_geometry,
-    compute_slice_bias,
+    _WEATHER_TYPES,
     _ensure_dir,
     _imwrite,
+    compute_slice_bias,
+    slice_geometry,
 )
 from ultralytics_ooo.pool.constants import _online_default
 
@@ -59,6 +53,40 @@ def _compat(cls, *args, **kwargs):
     if not accepts_var:
         kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
     return cls(*args, **kwargs)
+
+
+# Once-per-process latch for the "mosaic_save_* does nothing on stock Ultralytics" warning.
+_MOSAIC_SAVE_WARNED = False
+
+
+def _warn_mosaic_save_is_a_noop(hyp) -> None:
+    """Tell the user, once, that ``mosaic_save_*`` cannot do anything on a pristine Ultralytics.
+
+    Those four knobs come from the fork's ``Mosaic``, which accepted ``save_dir`` / ``save_max`` /
+    ``save_annotated`` / ``exist_ok``. The stock class is ``Mosaic(dataset, imgsz=640, p=1.0, n=4)``
+    -- it takes NO save argument -- so ``_compat`` strips all four and they are silent no-ops. The
+    keys stay registered (an existing ``args.yaml`` must keep loading rather than raise "not a valid
+    YOLO argument"), but setting one to a non-default value now says so instead of doing nothing.
+    """
+    global _MOSAIC_SAVE_WARNED
+    if _MOSAIC_SAVE_WARNED:
+        return
+    defaults = {
+        "mosaic_save_dir": "",
+        "mosaic_save_max": 0,
+        "mosaic_save_annotated": False,
+        "mosaic_save_exist_ok": False,
+    }
+    set_keys = [k for k, d in defaults.items() if _hyp_get(hyp, k) not in (None, d)]
+    if not set_keys:
+        return
+    _MOSAIC_SAVE_WARNED = True
+    LOGGER.warning(
+        "mosaic_save_* has no effect on a pristine Ultralytics: the stock Mosaic class takes no "
+        f"save argument, so {set_keys} are dropped at construction. Remove them; use the per-branch "
+        "save knobs (slice_save_dir / compose_save_dir / ratio_pad_save_dir / blur_save_dir / "
+        "weather_save_dir / occlusion_save_dir) instead."
+    )
 
 
 
@@ -173,6 +201,13 @@ class OnlineSlice(BaseTransform):
             raise ValueError(f"OnlineSlice: 'min_retain_ratio' must be in [0, 1], got {min_retain_ratio}.")
         if not 0.0 <= min_center_ratio <= 1.0:
             raise ValueError(f"OnlineSlice: 'min_center_ratio' must be in [0, 1], got {min_center_ratio}.")
+        # Seam-bias knobs were the one pair left unvalidated. A margin of 0 lets the seam reach an image
+        # edge, where the tile on that side degenerates (previously a hard crash inside cv2.resize, now
+        # clamped to 1 px by slice_geometry but still a useless sample), so require it strictly positive.
+        if not 0.0 < bias_margin <= 0.5:
+            raise ValueError(f"OnlineSlice: 'bias_margin' must be in (0, 0.5], got {bias_margin}.")
+        if not bias_jitter >= 0.0:
+            raise ValueError(f"OnlineSlice: 'bias_jitter' must be >= 0, got {bias_jitter}.")
         self.p = p
         self.overlap_ratio = overlap_ratio
         self.min_area_ratio = min_area_ratio
@@ -188,6 +223,16 @@ class OnlineSlice(BaseTransform):
         self.save_exist_ok = exist_ok
         self.save_max = save_max
         self.save_annotated = save_annotated
+        # Validate the save target NOW. This used to be deferred to the first _save_tile call, i.e.
+        # minutes into training and inside a DataLoader worker process -- where the traceback is
+        # unreadable and sibling workers may already have written files. v8_transforms builds this
+        # object on the trainer's MAIN process during dataset construction, so raising here is early
+        # and clean. (_save_tile keeps a cheap re-check for a directory created after construction.)
+        if self.save_dir is not None and not self.save_exist_ok and self.save_dir.exists():
+            raise FileExistsError(
+                f"OnlineSlice: save_dir '{self.save_dir}' already exists. Set slice_save_exist_ok=True to "
+                f"overwrite previous sliced outputs, or use a new slice_save_dir."
+            )
         # Per-instance state: positive/background tile counters (per worker) and saved-image counter.
         self._pos_count = 0
         self._bg_count = 0
@@ -297,14 +342,22 @@ class OnlineSlice(BaseTransform):
             )
         return slice_geometry(w, h, self.overlap_ratio, bx, by), bx, by
 
-    def _geometry(self, img: np.ndarray, label: dict[str, Any], key: Any = None) -> list:
-        """Convert boxes to pixel xyxy and compute the 4 tile intersection results.
+    def _geometry(self, img: np.ndarray, label: dict[str, Any], key: Any = None,
+                  only: int | None = None) -> list:
+        """Convert boxes to pixel xyxy and compute the tile intersection results.
 
         Args:
             key (Any): Original-image identity forwarded to ``_grid`` for the deterministic seam jitter.
+            only (int | None): When given, compute ONLY tile ``0..3``; the caller then reads result[0].
+                Both call sites already know which tile they will use -- mode A picks one at random and
+                ``slice_at`` is handed ``k`` -- so the other three were pure waste. The per-tile box maths
+                dominates (measured 0.28 ms plain / 0.58 ms with ``center_bias`` for 200 boxes on
+                4000x3000), and with ``slice_all_tiles`` the four ``slice_at`` calls each recomputed the
+                whole grid: 16 tiles' worth of work for the 4 that are actually used.
 
         Returns:
-            (list): List of ``(x0, y0, x1, y1, keep_idx, tile_local_xyxy)`` for the 4 grid tiles.
+            (list): ``(x0, y0, x1, y1, keep_idx, tile_local_xyxy)`` per computed tile -- all four when
+            ``only`` is None, otherwise just the requested one.
         """
         h, w = img.shape[:2]
         bbox_format = label.get("bbox_format", "xywh")
@@ -335,7 +388,9 @@ class OnlineSlice(BaseTransform):
 
         tiles, bx, by = self._grid(w, h, xyxy if n else None, key)
         tile_results = []  # (x0, y0, x1, y1, keep_idx, tile_local_xyxy)
-        for x0, y0, x1, y1 in tiles:
+        for ti, (x0, y0, x1, y1) in enumerate(tiles):
+            if only is not None and ti != only:
+                continue
             if n == 0:
                 tile_results.append((x0, y0, x1, y1, np.array([], dtype=int), np.empty((0, 4), dtype=np.float32)))
                 continue
@@ -486,9 +541,11 @@ class OnlineSlice(BaseTransform):
             return img, label
         if img.shape[1] < 2 or img.shape[0] < 2:
             return img, label
-        tile_results = self._geometry(img, label, key)
-        # Sample a random tile uniformly so that every tile is covered across epochs.
-        x0, y0, x1, y1, idx, local = random.choice(tile_results)
+        # Sample the tile FIRST, then compute only that tile. ``random.randrange(4)`` consumes exactly the
+        # same single draw as the ``random.choice(tile_results)`` it replaces, so the global random stream
+        # -- and therefore every downstream augmentation decision -- stays in lockstep.
+        k = random.randrange(4)
+        x0, y0, x1, y1, idx, local = self._geometry(img, label, key, only=k)[0]
         return self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
 
     def slice_at(self, img: np.ndarray, label: dict[str, Any], k: int,
@@ -509,8 +566,8 @@ class OnlineSlice(BaseTransform):
             return img, label
         if img.shape[1] < 2 or img.shape[0] < 2:
             return img, label
-        tile_results = self._geometry(img, label, key)
-        x0, y0, x1, y1, idx, local = tile_results[k]
+        # only=k: this call is handed the tile it must return, so there is no reason to build the other three.
+        x0, y0, x1, y1, idx, local = self._geometry(img, label, key, only=k)[0]
         sub, out_label = self._emit(img, label, x0, y0, x1, y1, idx, local, src, count)
         # Plan A fallback: when this tile is empty AND the background quota is reached, _emit returns
         # the ORIGINAL image unchanged (mode A contract). We keep that original image as-is -- bbox
@@ -534,13 +591,18 @@ def _hyp_get(hyp: Any, key: str, default: Any = _MISSING) -> Any:
     an older ``args.yaml`` / checkpoint that predates the key. Falling back the same way
     ``base._ONLINE_DEFAULTS`` already does for its per-call reads keeps one behaviour for the pipeline.
 
-    Resolution order: attribute on ``hyp`` -> ``default`` when given -> ``DEFAULT_CFG_DICT[key]``. A key
-    in neither place is a developer error (it is missing from ``ultralytics/cfg/default.yaml``), so it
-    raises a ``ValueError`` naming the key instead of silently picking a built-in literal -- which makes
-    the "register every new key in default.yaml" convention self-enforcing at build time.
+    Resolution order: attribute on ``hyp`` -> ``default`` when given -> ``DEFAULT_CFG_DICT[key]`` ->
+    the package's own ``_ONLINE_DEFAULTS`` table. A key present in none of them yields ``None`` (the
+    call sites' ``or ""`` / ``or 0`` / ``or False`` then apply their own empty default) -- it does NOT
+    raise. An earlier version of this docstring claimed it raised a ``ValueError`` "naming the key ...
+    which makes the register-every-new-key-in-default.yaml convention self-enforcing at build time";
+    that was never implemented, and the two statements contradicted each other in the same function.
+    The convention is instead enforced from the other side: upstream keys are looked up in
+    ``DEFAULT_CFG_DICT`` first, and ``pool/constants.py::check_online_defaults_are_project_only``
+    (asserted by ``install()``) fails loudly if the package table ever starts shadowing an upstream key.
 
-    不要改回 `getattr(hyp, "<key>", <字面量>)`: 默认值只能有一个真源 (default.yaml), 两处各写一遍
-    迟早漂移; 新增 cfg 键却忘了登记 default.yaml 时, 这里会立刻报错而不是静默用字面量兜底。
+    不要改回 `getattr(hyp, "<key>", <字面量>)`: 默认值只能有一个真源 (default.yaml / 包内默认表),
+    两处各写一遍迟早漂移。
 
     Deliberately NOT used for the upstream YOLO keys (``hyp.mosaic``, ``hyp.mixup``, ...): a ``hyp``
     missing those is genuinely broken and upstream raises on them too.
@@ -553,6 +615,65 @@ def _hyp_get(hyp: Any, key: str, default: Any = _MISSING) -> Any:
             # package's own default table instead of hard-failing (the upstream default.yaml is left untouched).
             default = _online_default(key)
     return getattr(hyp, key, default)
+
+
+_SLICE_PROB_WARNED = False
+
+
+def _resolve_slice_prob(hyp: Any) -> float:
+    """Normalise ``slice_prob`` to a float in [0, 1]; the AUTHORITATIVE read of that key.
+
+    ``slice_prob`` is the slicing pipeline's MASTER GATE -- this module only ever tests ``> 0`` and hands
+    the value straight to ``OnlineSlice(p=...)`` -- so a boolean is the natural way to write it and is now
+    a supported, documented type:
+
+        slice_prob=True   == 1.0   slice every slot of every selected image
+        slice_prob=False  == 0.0   slicing off (the default; equals upstream behaviour)
+        slice_prob=1.0 / 0.0 / 1 / 0   also accepted, unchanged
+
+    Booleans already reached ``OnlineSlice`` as 0.0/1.0 because ``bool`` subclasses ``int``; that was an
+    accident of the type system, not a contract, and a bare ``bool`` used to skip the range check entirely
+    (``OnlineSlice.__init__`` validates ``p`` but is never even constructed when ``slice_prob <= 0``, so
+    ``slice_prob=-1`` silently disabled slicing while ``slice_prob=2`` raised). Validating HERE closes that
+    hole: the value is checked before the ``> 0`` gate, so both ends of the range behave the same way.
+
+    The middle of the range ``0 < p < 1`` is still accepted -- it is a per-slot coin flip, and an args.yaml
+    or checkpoint from an older run may legitimately carry it -- but it WARNS once, because it is the most
+    misinterpreted knob in the package: it does not mean "slice this fraction of the images" (that is
+    ``slice_ratio``), it means "each of the 4 tiles independently decides whether to slice, and the losers
+    fall back to the WHOLE frame". Measured on a 4-tile pool: p=0.5 left only 14 of 32 slots as real tiles
+    and turned 16 into whole originals.
+    """
+    global _SLICE_PROB_WARNED
+    raw = _hyp_get(hyp, "slice_prob")
+    if isinstance(raw, bool):  # check BEFORE the numeric branch: bool is an int subclass
+        value = 1.0 if raw else 0.0
+    elif raw is None:
+        value = 0.0
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"slice_prob must be a bool or a number in [0, 1], got {raw!r} ({type(raw).__name__}). "
+                f"Use True/False (or 1.0/0.0) -- it is the slicing MASTER GATE, not a strength knob."
+            ) from None
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(
+            f"slice_prob must be in [0, 1], got {value} (from {raw!r}). Use False/0 to disable slicing, "
+            f"True/1 for fully sliced; a negative value is not a second way to mean 'off'."
+        )
+    if 0.0 < value < 1.0 and not _SLICE_PROB_WARNED:
+        _SLICE_PROB_WARNED = True
+        LOGGER.warning(
+            f"slice_prob={value:g} is a PER-SLOT coin flip, not a slicing strength: each tile of a "
+            f"selected image independently decides whether to slice, and the tiles that lose fall back to "
+            f"the WHOLE image (measured on a 4-tile pool: only 14 of 32 slots stayed real tiles, 16 became "
+            f"whole frames). Use slice_prob=1.0 plus slice_ratio=<fraction of IMAGES> to slice fewer "
+            f"images per epoch, and img_origin=True to also keep a whole-frame view of every original image "
+            f"(the unified coverage knob; off = the un-selected originals are dropped from the pool)."
+        )
+    return value
 
 
 
@@ -598,6 +719,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         >>> hyp.augmentations = augmentations
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
+    _warn_mosaic_save_is_a_noop(hyp)
     mosaic = _compat(Mosaic,
         dataset,
         imgsz=imgsz,
@@ -638,7 +760,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "linear")
 
     # ---- 在线切片 (slice_prob 独立开关) ----
-    slice_enabled = online_aug_on and _hyp_get(hyp, "slice_prob") > 0.0
+    # slice_prob 是【总开关】而不是强度旋钮: 布尔值 True/False 是正式支持的写法, 与 1.0/0.0 等价
+    # (归一 + 范围校验 + "0<p<1" 的解释性告警都收在 _resolve_slice_prob 里, 见其 docstring)。
+    slice_prob = _resolve_slice_prob(hyp)
+    slice_enabled = online_aug_on and slice_prob > 0.0
     if slice_enabled:
         # tile cap honours slice_save_max_tile override (falls back to slice_save_max when None).
         # tile is the ONLY branch whose cap lives on the OnlineSlice instance itself (see
@@ -648,7 +773,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         if _tile_cap is None:
             _tile_cap = int(_hyp_get(hyp, "slice_save_max"))
         dataset.slice_transform = OnlineSlice(
-            p=float(_hyp_get(hyp, "slice_prob")),
+            p=slice_prob,
             overlap_ratio=float(_hyp_get(hyp, "slice_overlap_ratio")),
             min_area_ratio=float(_hyp_get(hyp, "slice_min_tile_area_ratio")),
             min_retain_ratio=float(_hyp_get(hyp, "slice_min_box_retain_ratio")),
@@ -672,9 +797,17 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
         dataset.slice_all_tiles = False
         dataset.slice_ratio = 1.0
 
-    # ---- 独立增强开关 (slice_keep_origin / compose_keep / ratio_pad_keep / blur_keep 互不影响,
-    # 不受 slice_prob 控制; keep_origin 无切片时由 _keep_origin_on() 自动抑制) ----
-    dataset.slice_keep_origin = online_aug_on and bool(_hyp_get(hyp, "slice_keep_origin"))
+    # ---- 统一原图覆盖开关 (img_origin): 取代 slice_keep_origin ----
+    # img_origin=True 把每张原图作为 1 个整图槽放入样本池, 是"未选中原图"的统一覆盖机制; 关闭时未被
+    # 任何增强分支选中的原图将真正从池中丢弃。slice_keep_origin 已废弃: 若配置里仍有, 映射并告警一次。
+    legacy_keep = _hyp_get(hyp, "slice_keep_origin", None)
+    if legacy_keep is not None:
+        LOGGER.warning(
+            "slice_keep_origin is deprecated and replaced by img_origin; "
+            "mapping slice_keep_origin=True -> img_origin=True for this run. Update your config."
+        )
+    img_origin = _hyp_get(hyp, "img_origin", legacy_keep if legacy_keep is not None else _online_default("img_origin"))
+    dataset.img_origin = online_aug_on and bool(img_origin)
     # ---- 独立增强开关 (compose_keep / ratio_pad_keep / blur_keep 互不影响, 不受 slice_prob 控制) ----
     # compose/ratio/blur 不需要切片或 keep_origin, 单独开启即生效(见 _segment_bases 区段布局)。
     dataset.compose_keep = online_aug_on and bool(_hyp_get(hyp, "compose_keep"))
@@ -700,6 +833,15 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # 否则键在 default.yaml 里注册了却到不了 dataset, _build_blur_sample 只会读到内置默认值。
     dataset.blur_axis_aligned = bool(_hyp_get(hyp, "blur_axis_aligned"))
     dataset.blur_save_dir = str(_hyp_get(hyp, "blur_save_dir") or "")
+    # ---- 每 epoch 增强比例 (ratio_pad_ratio / blur_ratio / compose_ratio) ----
+    # 必须与 weather_ratio / occlusion_ratio 一样显式镜像到 dataset。这三条此前被漏掉了:
+    # _rebuild_epoch_masks 读的是 getattr(self, <ratio_attr>, _online_default(<ratio_attr>)),
+    # 属性不存在时静默取到兜底值 1.0 -> 掩码恒为 None -> 该分支 EVERY epoch 对 EVERY 原图生效,
+    # 用户配置的 0.1 完全无效 (实测 ratio/blur/compose 恒 100% 增强, 而 slice/weather/occlusion
+    # 按配置生效, 分支之间严重失衡)。被 test_ooo_branches.py 的结构性断言锁死。
+    dataset.ratio_pad_ratio = float(_hyp_get(hyp, "ratio_pad_ratio"))
+    dataset.blur_ratio = float(_hyp_get(hyp, "blur_ratio"))
+    dataset.compose_ratio = float(_hyp_get(hyp, "compose_ratio"))
     # ---- 在线气象退化 (weather_*): 雨/雾/噪声, 标签不变, 独立开关 + epoch 级比例 (复用掩码机制) ----
     dataset.weather_keep = online_aug_on and bool(_hyp_get(hyp, "weather_keep"))
     dataset.weather_ratio = float(_hyp_get(hyp, "weather_ratio"))

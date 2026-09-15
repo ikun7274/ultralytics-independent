@@ -63,8 +63,8 @@ def patch_resume(trainer_cls) -> None:
                     args["epochs"] = extend_epochs
                     args["patience"] = self.args.patience
                 else:
-                    setattr(args, "epochs", extend_epochs)
-                    setattr(args, "patience", self.args.patience)
+                    args.epochs = extend_epochs
+                    args.patience = self.args.patience
             # New total + rebuild LR schedule against the new epoch count.
             self.epochs = self.args.epochs = extend_epochs
             self._setup_scheduler()

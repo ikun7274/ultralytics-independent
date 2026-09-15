@@ -1,0 +1,53 @@
+# Ruff configuration for the ultralytics_ooo package only.
+#
+# Scoped to this directory on purpose: the repository's own pyproject.toml belongs to pristine upstream
+# Ultralytics and the package's "zero-intrusion" contract means we do not edit it. Ruff discovers the
+# nearest config walking up from each file, so `ruff check ultralytics_ooo` from the repo root picks
+# this up while upstream sources keep using the root pyproject.toml.
+#
+# Run:
+#   ruff check ultralytics_ooo          # lint
+#   ruff check --fix ultralytics_ooo    # autofix the mechanical ones
+#
+# The rule selection targets exactly the defect classes this package has actually produced:
+#   F401  unused imports            (9 dead imports were removed during the audit)
+#   F811  redefinition / shadowing  (_save_cap was defined on top of its own import)
+#   B009  getattr with a constant   (the reason _hyp_get exists)
+#   BLE   blind except              (three silent `except Exception: return` masked a dead epoch-sync)
+#   B     other bugbear findings    (mutable defaults, useless comparisons, ...)
+#   E/W   pycodestyle               (with E501 off, see below)
+#   I/UP  import order / modernisation -- enabled, but see the note in the CI workflow.
+
+line-length = 120
+target-version = "py38"
+
+[lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "B",
+    "BLE",
+    "I",
+    "UP",
+]
+ignore = [
+    # E501: 9 lines in the package exceed 120 chars (8 in pool/dataset.py, 1 in pool/constants.py), almost
+    # all of them comment lines mirrored verbatim from the fork or from upstream. Reflowing them would
+    # make future diffs against the mirrored source harder to read, which is a worse trade than the
+    # cosmetic win. Turn this off (and fix those 9 lines) if you ever want the strict form.
+    "E501",
+    # UP031/UP032: this codebase deliberately mixes %-formatting copied from upstream with f-strings.
+    "UP031",
+    "UP032",
+]
+
+[lint.per-file-ignores]
+# Package __init__ modules exist to re-export; their names are declared in __all__ (and Ruff does not
+# model __all__ for F401 in all configurations).
+"__init__.py" = ["F401", "I001"]
+"core/__init__.py" = ["F401", "I001"]
+"pool/__init__.py" = ["F401", "I001"]
+
+[lint.isort]
+known-first-party = ["ultralytics_ooo", "ultralytics"]

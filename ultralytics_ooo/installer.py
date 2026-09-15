@@ -9,6 +9,11 @@ Note: on a stock Ultralytics the online slice/degrade augmentation is OFF by def
 (``slice_prob=0``), so until the augment-assembly layer (OnlineSlice / project-level v8_transforms
 overrides) is installed, behaviour is byte-for-byte upstream. That is the safe midpoint.
 
+Everything this module installs lives under ``pool/`` (they are NOT top-level submodules):
+``pool.dataset`` (mixed pool + fraction guard), ``pool.augment_setup`` (OnlineSlice / v8_transforms),
+``pool.sampler`` (grouped sampler + build_dataloader), ``pool.resume`` (resume_extend_epochs),
+``pool.valslice`` (sliced validation) and ``pool.dual`` (dual-metric validation).
+
 The dataset subclass is defined at MODULE TOP LEVEL (not as a closure inside install()). Windows
 ``spawn`` DataLoader workers unpickle it by re-importing this module and looking the name up there;
 a class defined inside install() never exists in a worker, which only runs main() and imports the
@@ -27,14 +32,25 @@ def install() -> None:
         return
 
     import ultralytics.data.build as _build
-    from ultralytics_ooo.dataset_class import InstalledYOLODataset
 
     # Register the online hyperparameters onto the stock config namespace so model.train(slice_prob=...)
     # passes check_dict_alignment. get_cfg builds its base via cfg2dict(DEFAULT_CFG), so the keys must
     # live on the DEFAULT_CFG SimpleNamespace itself (not only DEFAULT_CFG_DICT). We never edit upstream
     # default.yaml; we only add missing attributes at runtime.
-    from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_DICT
-    from ultralytics_ooo.pool.constants import _ONLINE_DEFAULTS
+    from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_DICT, LOGGER
+    from ultralytics_ooo.dataset_class import InstalledYOLODataset
+    from ultralytics_ooo.pool.constants import _ONLINE_DEFAULTS, check_online_defaults_are_project_only
+
+    # Snapshot the PRISTINE upstream key set before the loop below adds our own keys to it: comparing
+    # against the live dict afterwards would "discover" every project key as an upstream duplicate.
+    _pristine_keys = set(DEFAULT_CFG_DICT)
+    _drift = check_online_defaults_are_project_only(_pristine_keys)
+    if _drift:
+        LOGGER.warning(
+            f"ultralytics_ooo: {len(_drift)} config key(s) in pool/constants.py::_ONLINE_DEFAULTS are "
+            f"also defined by upstream default.yaml ({_drift}). The package fallbacks for them are "
+            f"stale -- delete them from the table so upstream stays the single source of truth."
+        )
 
     for _k, _v in _ONLINE_DEFAULTS.items():
         if not hasattr(DEFAULT_CFG, _k):
@@ -57,7 +73,13 @@ def install() -> None:
     from ultralytics.utils.callbacks.base import default_callbacks
 
     def _ooo_set_epoch(trainer):
-        dl = getattr(trainer, "train_dataloader", None)
+        # ``train_loader`` is the attribute upstream actually sets (trainer.py:286, and every use of it):
+        # there is NO ``train_dataloader`` on BaseTrainer. Reading the wrong name made this callback a
+        # silent no-op, which meant set_epoch -- and therefore the whole per-epoch ratio draw and
+        # ``close_aug_epoch`` -- never ran in a real training. The fallback keeps a future upstream
+        # rename from reverting to that same silent state, and the trailing warning makes it audible
+        # instead of invisible.
+        dl = getattr(trainer, "train_loader", None) or getattr(trainer, "train_dataloader", None)
         ds = getattr(dl, "dataset", None) if dl is not None else None
         # Unwrap DataLoader / InfiniteDataLoader / batch-sampler wrappers down to the real dataset.
         for _ in range(4):
@@ -69,8 +91,20 @@ def install() -> None:
             ds = inner
         if ds is not None and hasattr(ds, "set_epoch"):
             ds.set_epoch(trainer.epoch, trainer.epochs)
+            return True
+        LOGGER.warning(
+            f"ultralytics_ooo: could not find the training dataset on the trainer "
+            f"({type(trainer).__name__}); the per-epoch *_ratio draw and close_aug_epoch stay frozen "
+            f"at epoch 0. Attribute names to check: train_loader / train_dataloader."
+        )
+        return False
 
-    default_callbacks["on_train_epoch_start"].append(_ooo_set_epoch)
+    # Idempotent by MARKER, not by identity: ``_INSTALLED`` only guards this process's first call, so a
+    # second copy of the package (re-imported after a sys.modules purge, or imported twice via different
+    # paths) would append a second callback and call set_epoch twice per epoch. The marker survives both.
+    _ooo_set_epoch._ooo_epoch_callback = True
+    if not any(getattr(f, "_ooo_epoch_callback", False) for f in default_callbacks["on_train_epoch_start"]):
+        default_callbacks["on_train_epoch_start"].append(_ooo_set_epoch)
 
     # Patch resume_extend_epochs onto the trainer (修补续训): repair ckpt metadata + rebuild LR schedule
     # when resuming past the checkpoint's finished epoch count.
@@ -96,7 +130,7 @@ def install() -> None:
     patch_build_dataloader()
 
     # Survive fraction rounding to zero on a tiny dataset.
-    from ultralytics_ooo.pool.dataset import patch_fraction_guard
+    from ultralytics_ooo.pool.fraction import patch_fraction_guard
 
     patch_fraction_guard()
 

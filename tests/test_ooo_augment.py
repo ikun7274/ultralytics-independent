@@ -59,3 +59,43 @@ def test_online_defaults_cover_fork_keys():
 
     for k in ("slice_prob", "blur_keep", "ratio_pad_keep", "compose_keep", "close_aug_epoch"):
         assert k in _ONLINE_DEFAULTS, k
+
+
+def test_mosaic_save_knobs_warn_that_they_are_inert(monkeypatch):
+    """``mosaic_save_*`` came from the fork's Mosaic, which the stock class cannot honour.
+
+    Stock ``Mosaic.__init__`` is ``(dataset, imgsz, p, n)`` -- no save argument -- so ``_compat``
+    strips all four keys at construction and they are silent no-ops. Setting one must therefore WARN
+    (exactly once) instead of letting the user believe mosaics are being written to disk.
+    """
+    import inspect
+    import logging
+
+    from ultralytics.data.augment import Mosaic
+    from ultralytics_ooo.pool import augment_setup as au
+
+    # premise: the stock class really takes no save argument (this is what makes the keys inert)
+    params = set(inspect.signature(Mosaic.__init__).parameters)
+    assert not params & {"save_dir", "save_max", "save_annotated", "exist_ok"}, params
+
+    records = []
+
+    class _H(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    logger = logging.getLogger("ultralytics")
+    monkeypatch.setattr(au, "_MOSAIC_SAVE_WARNED", False)
+    logger.addHandler(_H())
+    try:
+        au._warn_mosaic_save_is_a_noop(SimpleNamespace())  # all defaults -> must stay silent
+        assert not [m for m in records if "mosaic_save" in m], records
+        au._warn_mosaic_save_is_a_noop(SimpleNamespace(mosaic_save_dir="/tmp/x"))
+        au._warn_mosaic_save_is_a_noop(SimpleNamespace(mosaic_save_max=10))  # 2nd -> once per process
+    finally:
+        logger.handlers.pop()
+
+    warned = [m for m in records if "mosaic_save" in m]
+    assert len(warned) == 1, f"expected exactly one warning, got {len(warned)}: {records}"
+    assert "mosaic_save_dir" in warned[0], warned[0]
+    assert "slice_save_dir" in warned[0], warned[0]

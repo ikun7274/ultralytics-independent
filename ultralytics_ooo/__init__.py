@@ -5,9 +5,9 @@ installable on top of an unmodified upstream Ultralytics:
 
 * ``ultralytics_ooo.core``  — framework-free numeric kernels (numpy/cv2 only): slicing geometry,
   degradation operators (motion blur / weather / occlusion / aspect-ratio pad), unicode-safe savers.
-* ``ultralytics_ooo.pool``  — the mixed virtual-sample pool that extends a YOLO dataset's index space.
-* ``ultralytics_ooo.resume``— patch-resume for stripped ``last.pt`` checkpoints.
-* ``ultralytics_ooo.valslice``— SAHI-style sliced validation with NMS fusion.
+* ``ultralytics_ooo.pool``  — everything that touches Ultralytics: the mixed virtual-sample pool that
+  extends a YOLO dataset's index space, plus the runtime patches for augment assembly, grouped
+  sampling, patch-resume, sliced validation and dual-metric validation.
 * ``ultralytics_ooo.installer`` — one-call ``install()`` that wires all of the above onto a stock
   Ultralytics installation without editing upstream source.
 

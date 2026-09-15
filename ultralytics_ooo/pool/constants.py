@@ -1,22 +1,40 @@
 """Online-augmentation constants and memory-budget helpers (mirrored from the forked BaseDataset).
 
-Single source of truth for the online-augmentation fallbacks. ``default.yaml`` remains the
-authoritative user-facing default; this table exists so the fallbacks cannot drift between the
-many ``getattr(self, <online key>, <literal>)`` call sites.
+Single source of truth for the PROJECT-ONLY fallbacks. ``default.yaml`` remains the authoritative
+user-facing default for every key upstream defines; this table exists so the fallbacks cannot drift
+between the many ``getattr(self, <online key>, <literal>)`` call sites.
+
+The table deliberately holds ONLY keys upstream does not have. It used to restate 96 upstream keys
+(``optimizer`` / ``lr0`` / ``close_mosaic`` / ``patience`` / ...) verbatim. Those rows could never take
+effect on ``DEFAULT_CFG`` -- ``install()`` only writes a key when ``not hasattr(DEFAULT_CFG, k)``, which
+is always False for an upstream key -- yet they WERE live as the ``_online_default()`` fallback behind
+~120 ``getattr(self, key, _online_default(key))`` sites, so any upstream version bump that changed one of
+those defaults would have diverged silently through the fallback path.
+``check_online_defaults_are_project_only`` is asserted by ``install()`` so the reverse drift (upstream
+later adding one of our keys) surfaces immediately instead of silently.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
-# Single source of truth for the online-augmentation defaults used when the dataset was NOT assembled
-# by ``v8_transforms`` (direct construction, tests, offline reuse).
+# Single source of truth for the ONLINE-AUGMENTATION defaults used when the dataset was NOT assembled
+# by ``v8_transforms`` (direct construction, tests, offline reuse). Project-only keys; upstream keys
+# resolve through DEFAULT_CFG / DEFAULT_CFG_DICT.
 _ONLINE_DEFAULTS: dict[str, Any] = {
-    "slice_ratio": 1.0,
+    # --- online slicing (SAHI) ---
+    # slice_prob is the slicing MASTER GATE: bool True/False is a supported spelling (== 1.0/0.0) and is
+    # normalised by augment_setup._resolve_slice_prob, which also range-checks it and warns for 0<p<1
+    # (a per-slot coin flip, not a strength knob -- use slice_ratio for that).
     "slice_prob": 0.0,
+    "slice_ratio": 1.0,
+    "slice_all_tiles": False,
     "slice_overlap_ratio": 0.2,
+    # img_origin: unified "put EVERY original image into the pool as one whole-frame slot" coverage
+    # knob. Replaces the old slice_keep_origin (which only covered the SLICED images). With it on, every
+    # image appears at least once per epoch; with it off, an image no augmentation branch selected is
+    # simply absent from the pool (the "discard the un-selected" behaviour the ratio-sized layout enables).
+    "img_origin": True,
     "slice_min_tile_area_ratio": 0.005,
     "slice_min_box_retain_ratio": 0.4,
     "slice_min_center_retain_ratio": 0.6,
@@ -26,44 +44,59 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "slice_bias_jitter": 0.05,
     "slice_full_box_only": False,
     "slice_background_ratio": -1,
+    # --- per-epoch branch ratios (mask = round(ratio * count) random positions) ---
     "ratio_pad_ratio": 1.0,
     "blur_ratio": 1.0,
     "compose_ratio": 1.0,
     "weather_ratio": 0.5,
     "occlusion_ratio": 0.5,
-    "slice_all_tiles": False,
-    "slice_keep_origin": False,
+    # --- independent branch switches ---
     "ratio_pad_keep": False,
     "blur_keep": False,
     "compose_keep": False,
     "weather_keep": False,
     "occlusion_keep": False,
+    "close_aug_epoch": 0,
+    # --- aspect-ratio pad ---
+    "ratio_pad_target": "auto",
+    "ratio_pad_color": "black",
+    # --- motion blur ---
     "blur_short_len_min": 5,
     "blur_short_len_max": 12,
     "blur_long_len_min": 20,
     "blur_long_len_max": 35,
     "blur_long_defocus_sigma": 1.0,
     "blur_axis_aligned": True,
+    # --- weather degradation ---
     "weather_types": "rain,haze,noise",
     "weather_rain_density": 0.15,
     "weather_rain_length": 15.0,
     "weather_haze_beta": 0.4,
     "weather_noise_std": 15.0,
+    # --- occlusion ---
     "occlusion_types": "rect,stripe",
     "occlusion_blocks": 1,
     "occlusion_size_ratio": 0.1,
     "occlusion_color": "auto",
     "occlusion_max_cover": 0.95,
-    "ratio_pad_target": "auto",
-    "ratio_pad_color": "black",
+    # --- compose + working-resolution caps ---
     "compose_max_side": 0,
     "degrade_max_side": 0,
     "degrade_resample": "linear",
+    # --- sampling / caching budget ---
     "slice_grouped_sampler": True,
-    "slice_raw_cache_size": 2,
-    "prefetch_factor": 2,
+    # Per-worker raw-image LRU capacity. Values <= 4 are floored to 4 by the dataset (a smaller
+    # cache cannot even hold one image's tiles), so this IS the effective default.
+    # MEASURED (24 images, all branches on, 120 LRU reads/epoch):
+    #   grouped sampler ON, cache 4  -> 80.0% hit (the compulsory-miss ceiling: 1 - N/reads)
+    #   grouped sampler ON, cache 8  -> 80.8% (noise-level gain) for 2x the resident RAM
+    #   cache > the busiest image's fan-out -> the grouped sampler is DISABLED and the hit rate
+    #     DROPS to ~60% (shuffled order cannot keep an image's slots resident), so raising this
+    #     past ~10 slots backfires -- see the warning in grouped_sample_units().
+    "slice_raw_cache_size": 4,
     "ims_cache_frames": 0,
     "ims_cache_mb": 1024,
+    # --- annotated-save knobs ---
     "slice_save_annotated": True,
     "slice_save_max": 0,
     "slice_save_exist_ok": True,
@@ -74,129 +107,64 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "slice_save_max_weather": None,
     "slice_save_max_occlusion": None,
     "slice_save_dir": None,
+    "compose_save": False,
     "compose_save_dir": "",
     "ratio_pad_save_dir": "",
     "blur_save_dir": "",
     "weather_save_dir": "",
     "occlusion_save_dir": "",
-    # mosaic annotated-save knobs (fork-only, read via _hyp_get; upstream has none of these)
+    # mosaic annotated-save knobs: NO-OP on a pristine Ultralytics. The stock ``Mosaic`` is
+    # ``Mosaic(dataset, imgsz, p, n)`` -- it takes no save argument -- so ``_compat`` in
+    # ``augment_setup`` strips all four at construction. They are kept registered ONLY so an existing
+    # args.yaml/checkpoint keeps loading instead of raising "not a valid YOLO argument"; setting one
+    # away from its default now warns once (see ``_warn_mosaic_save_is_a_noop``). Use the per-branch
+    # ``*_save_dir`` knobs below instead.
     "mosaic_save_dir": "",
     "mosaic_save_max": 0,
     "mosaic_save_annotated": False,
     "mosaic_save_exist_ok": False,
-    "task": 'detect',
-    "mode": 'train',
-    "epochs": 100,
-    "patience": 100,
-    "batch": 16,
-    "imgsz": 640,
-    "save": True,
-    "save_period": -1,
-    "cache": False,
-    "workers": 8,
-    "exist_ok": False,
-    "pretrained": True,
-    "cls_remap": True,
-    "optimizer": 'auto',
-    "verbose": True,
-    "seed": 0,
-    "deterministic": True,
-    "single_cls": False,
-    "rect": False,
-    "cos_lr": False,
-    "close_mosaic": 10,
-    "resume": False,
+    # --- resume-extension ---
     "resume_extend_epochs": 0,
-    "amp": True,
-    "fraction": 1.0,
-    "profile": False,
-    "multi_scale": 0.0,
-    "compile": False,
-    "overlap_mask": True,
-    "mask_ratio": 4,
-    "dropout": 0.0,
-    "val": True,
-    "split": 'val',
-    "save_json": False,
-    "iou": 0.7,
-    "max_det": 300,
-    "dnn": False,
-    "plots": True,
-    "vid_stride": 1,
-    "stream_buffer": False,
-    "visualize": False,
-    "augment": False,
-    "agnostic_nms": False,
-    "retina_masks": False,
-    "show": False,
-    "save_frames": False,
-    "save_txt": False,
-    "save_conf": False,
-    "save_crop": False,
-    "show_labels": True,
-    "show_conf": True,
-    "show_boxes": True,
-    "format": 'torchscript',
-    "keras": False,
-    "optimize": False,
-    "dynamic": False,
-    "simplify": True,
-    "nms": False,
-    "lr0": 0.01,
-    "lrf": 0.01,
-    "momentum": 0.937,
-    "weight_decay": 0.0005,
-    "warmup_epochs": 3.0,
-    "warmup_momentum": 0.8,
-    "warmup_bias_lr": 0.1,
-    "dis": 6.0,
-    "box": 7.5,
-    "cls": 0.5,
-    "cls_pw": 0.0,
-    "dfl": 1.5,
-    "pose": 12.0,
-    "kobj": 1.0,
-    "rle": 1.0,
-    "angle": 1.0,
-    "dlog": 1.0,
-    "dgrad": 0.5,
-    "dlam": 1.0,
-    "nbs": 64,
-    "hsv_h": 0.015,
-    "hsv_s": 0.7,
-    "hsv_v": 0.4,
-    "degrees": 0.0,
-    "translate": 0.1,
-    "scale": 0.5,
-    "shear": 0.0,
-    "perspective": 0.0,
-    "flipud": 0.0,
-    "fliplr": 0.5,
-    "bgr": 0.0,
-    "mosaic": 1.0,
+    # --- validation-side slicing (SAHI eval) ---
     "val_slice_enable": False,
     "val_slice_all_tiles": False,
     "val_slice_ratio": 1.0,
     "val_slice_overlap_ratio": 0.2,
     "val_slice_nms_iou": 0.5,
     "val_slice_dual_metric": False,
-    "compose_save": False,
-    "close_aug_epoch": 0,
-    "mixup": 0.0,
-    "cutmix": 0.0,
-    "copy_paste": 0.0,
-    "copy_paste_mode": 'flip',
-    "auto_augment": 'randaugment',
-    "erasing": 0.4,
-    "tracker": 'tracktrack.yaml',
 }
 
 
 def _online_default(key: str) -> Any:
-    """Return the package fallback for ``key``. Unknown keys (e.g. upstream mosaic_save_* knobs the
-    forked code reads through _hyp_get but this package does not ship) return None, which the call
-    sites' ``or ""`` / ``or 0`` / ``or False`` turn into a safe empty default."""
+    """Return the package fallback for ``key``; unknown keys return None, which the call sites'
+    ``or ""`` / ``or 0`` / ``or False`` turn into a safe empty default.
+
+    Upstream keys are NOT meant to be looked up here -- ``_hyp_get`` already prefers
+    ``DEFAULT_CFG_DICT`` and only lands here for keys upstream does not define.
+    """
     return _ONLINE_DEFAULTS.get(key)
+
+
+def check_online_defaults_are_project_only(upstream_keys=None) -> list[str]:
+    """Return the config-table keys upstream ALSO defines (should always be an empty list).
+
+    The invariant is the reverse of the one the old table relied on: the table must contain no upstream
+    key at all. A key present in both places is skipped by ``install()``'s ``if not hasattr(DEFAULT_CFG,
+    k)`` guard -- so the package value is never applied -- while remaining live as the
+    ``_online_default()`` fallback, i.e. a silent divergence from upstream defaults waiting for a
+    version bump.
+
+    Args:
+        upstream_keys: the pristine upstream key set. ``install()`` MUST pass the snapshot it took
+            BEFORE registering our keys, because it writes them into ``DEFAULT_CFG_DICT`` itself --
+            comparing against the live dict afterwards reports every project key as a duplicate. Pass
+            an explicit set (e.g. parsed from ``cfg/default.yaml``) for an install-order-independent check.
+    """
+    if upstream_keys is None:
+        from ultralytics.utils import DEFAULT_CFG_DICT
+
+        upstream_keys = set(DEFAULT_CFG_DICT)
+    return sorted(k for k in _ONLINE_DEFAULTS if k in upstream_keys)
 
 
 def get_split_fraction(fraction, split: str):

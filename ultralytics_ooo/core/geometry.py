@@ -23,6 +23,12 @@ def slice_geometry(
     Slice size = half the image extent scaled by ``(1 + overlap_ratio)``. ``bias_x``/``bias_y``
     (in [-0.5, 0.5]) shift the cut seam away from the centre so the caller can place it in the
     sparsest object regions. The tile count, full-image coverage and total overlap are unchanged.
+
+    Both tiles on each axis are guaranteed NON-DEGENERATE (width/height >= 1). The seam offset used to
+    be clamped only to the image extent, which is not sufficient: with ``overlap_ratio == 0`` the slice
+    is exactly ``w/2``, so a full ``|bias| == 0.5`` drove ``sw - dx`` to 0 and produced a zero-width
+    tile that later died in ``cv2.resize`` with ``(-215:Assertion failed) !ssize.empty()`` inside a
+    DataLoader worker. Reachable through ``slice_bias_margin=0`` before that key was validated.
     """
     if not 0.0 <= overlap_ratio < 1.0:
         raise ValueError(f"slice_geometry: 'overlap_ratio' must be in [0, 1), got {overlap_ratio}.")
@@ -32,8 +38,13 @@ def slice_geometry(
         raise ValueError(f"slice_geometry: 'bias_y' must be in [-0.5, 0.5], got {bias_y}.")
     sw = min(w, max(1, int((1 + overlap_ratio) * w / 2)))
     sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
-    dx = max(sw - w, min(w - sw, int(round(bias_x * w))))
-    dy = max(sh - h, min(h - sh, int(round(bias_y * h))))
+    # Keep both tile extents within the image (the original rule) AND >= 1 px (the non-degeneracy
+    # guarantee). Intersecting the two ranges means behaviour is untouched wherever the original clamp
+    # was already non-degenerate, and only the collapsing cases move.
+    dx = int(round(bias_x * w))
+    dy = int(round(bias_y * h))
+    dx = max(max(sw - w, 1 - sw), min(min(w - sw, sw - 1), dx))
+    dy = max(max(sh - h, 1 - sh), min(min(h - sh, sh - 1), dy))
     tw1, tw2 = sw + dx, sw - dx
     th1, th2 = sh + dy, sh - dy
     return [

@@ -27,7 +27,9 @@ def _fake_base(n=4, w=800, h=600):
         prefix = "val: "
         training = False
         device = "cpu"
-        transforms = lambda self, x: x
+        def transforms(self, x):
+            return x
+
         collate_fn = staticmethod(lambda b: b)
 
         def __init__(self, labels, img):
@@ -99,3 +101,44 @@ def test_patch_validator_idempotent():
     patch_validator(FakeV)
     assert FakeV.update_metrics is first
     assert hasattr(FakeV, "_val_slice_active")
+
+
+def test_missing_shape_is_an_explicit_passthrough_not_an_empty_crop():
+    """A label without 'shape' must NOT become a 0x0 crop.
+
+    ``shape`` is the only source of the original H/W, so a missing key used to fall back to
+    ``(0, 0)``, which made the tile bounds ``(0, 0, 0, 0)`` -> ``im[0:0, 0:0]`` -> an EMPTY array that
+    only blows up much later, inside a DataLoader worker, as a cv2.resize assertion. The loaded frame
+    is authoritative, so the sample must degrade to a whole-frame passthrough -- and say so once,
+    because otherwise slicing validation would silently stop slicing anything.
+    """
+    import logging
+
+    from ultralytics_ooo.pool.valslice import SliceValDataset
+
+    base = _fake_base(n=2, w=400, h=300)
+    for lb in base.labels:
+        lb.pop("shape")  # simulate the stripped-shape path (e.g. set_rectangle on self.labels)
+
+    records = []
+
+    class _H(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    logger = logging.getLogger("ultralytics")
+    logger.addHandler(_H())
+    try:
+        ds = SliceValDataset(base, overlap_ratio=0.2, all_tiles=True, ratio=1.0)
+    finally:
+        logger.handlers.pop()
+
+    assert [m for m in records if "no 'shape'" in m], f"the degradation must be reported: {records}"
+    # unknown geometry -> one whole-frame slot per image, never an expanded (and unusable) tile set
+    assert len(ds) == 2, ds._counts
+    for i in range(len(ds)):
+        s = ds[i]
+        assert s["img"].size > 0, f"index {i}: empty crop"
+        assert s["img"].shape[:2] == (300, 400), s["img"].shape
+        assert s["val_slice_meta"]["sliced"] is False, s["val_slice_meta"]
+        assert s["val_slice_meta"]["orig_shape"] == (300, 400), s["val_slice_meta"]

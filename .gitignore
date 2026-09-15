@@ -211,3 +211,8 @@ results.csv
 fuzz-sources/
 fuzz-datasets/
 fuzz-models/
+
+# Agent workbuddy memory
+.workbuddy/
+__pycache__/
+*.pyc

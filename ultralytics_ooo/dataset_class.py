@@ -10,7 +10,6 @@ the worker inherits the parent's ``sys.path``).
 from __future__ import annotations
 
 from ultralytics.data.dataset import YOLODataset
-
 from ultralytics_ooo.pool.dataset import OnlinePoolDataset
 
 
