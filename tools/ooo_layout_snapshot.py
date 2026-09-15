@@ -80,7 +80,6 @@ def _dataset_root(n: int) -> Path:
 def build(n: int, ratio: float, **extra):
     from ultralytics.cfg import get_cfg
     from ultralytics.data.build import build_yolo_dataset
-
     from ultralytics_ooo import install
 
     install()
@@ -116,7 +115,7 @@ def signature(label: dict) -> dict:
     return {
         "src": Path(label["im_file"]).stem,  # compose/ratio report their first source
         "ori_shape": list(label["ori_shape"]),
-        "n_boxes": int(len(boxes)),
+        "n_boxes": len(boxes),
         "labels": hashlib.sha1(payload).hexdigest()[:12],
     }
 

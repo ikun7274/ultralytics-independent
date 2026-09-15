@@ -99,15 +99,31 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "degrade_resample": "linear",
     # --- sampling / caching budget ---
     "slice_grouped_sampler": True,
-    # Per-worker raw-image LRU capacity. Values <= 4 are floored to 4 by the dataset (a smaller
-    # cache cannot even hold one image's tiles), so this IS the effective default.
-    # MEASURED (24 images, all branches on, 120 LRU reads/epoch):
-    #   grouped sampler ON, cache 4  -> 80.0% hit (the compulsory-miss ceiling: 1 - N/reads)
-    #   grouped sampler ON, cache 8  -> 80.8% (noise-level gain) for 2x the resident RAM
-    #   cache > the busiest image's fan-out -> the grouped sampler is DISABLED and the hit rate
-    #     DROPS to ~60% (shuffled order cannot keep an image's slots resident), so raising this
-    #     past ~10 slots backfires -- see the warning in grouped_sample_units().
-    "slice_raw_cache_size": 4,
+    # Per-worker raw-image LRU capacity, in FRAMES of the original-resolution image. Values in (0, 4)
+    # are floored to 4 by the dataset, so 4 is the smallest usable cache; 0 disables the LRU entirely.
+    #
+    # The capacity has to cover the images that are actually re-read close together, and there are two
+    # regimes, so 16 is chosen to cover BOTH:
+    #   * grouped sampler (the default): a unit holds <= 4 images and is walked round-robin, so 4 frames
+    #     already hold a whole unit;
+    #   * plain shuffle (slice_grouped_sampler=False, or no image has 2+ slots): an image's slots are
+    #     spread across the whole pool, and the only window that repeats is Mosaic's, i.e.
+    #     ``max_buffer_length`` pool SLOTS. At the shipped batch sizes that is <= 127 slots, which at
+    #     ~5 slots/image is ~13-25 distinct images.
+    # MEASURED (240 images, 1280x720, slice_all_tiles=True + slice_ratio=1.0, real DataLoader, no
+    # worker procs): cap 4 -> 20.4 items/s, cap 16 -> 41.0, cap 32 -> 44.3, i.e. +85% from 4 to 32, and
+    # the gain is already ~80% of that by 16. Per-sample view (same data): cap 4 49.90 ms / 2.33 decodes
+    # per sample, cap 16 32.07 ms / 1.38, cap 32 31.08 ms / 0.93 -- the curve saturates at 16-32.
+    # The old default of 4 was set from a 24-image pool where the whole dataset fits in the Mosaic window
+    # and capacity cannot matter, so it did not extrapolate to real dataset sizes.
+    "slice_raw_cache_size": 16,
+    # Byte budget for the same LRU, per worker (MiB; 0 = no byte limit, frames alone decide). The cache
+    # stores ORIGINAL-resolution frames, whose size is not known before the first decode, so the frame
+    # count above cannot be converted to memory up front. This budget is enforced on every insert: a
+    # 1280x720 frame is 2.6 MiB, but a 4000x3000 one is 34 MiB, where 16 frames would be 550 MiB/worker.
+    # With the default 256 MiB: 720p keeps all 16 frames, 4000x3000 keeps 7. 0 = trust
+    # slice_raw_cache_size (only do that when you know the frame size).
+    "slice_raw_cache_mb": 256,
     "ims_cache_frames": 0,
     "ims_cache_mb": 1024,
     # --- annotated-save knobs ---

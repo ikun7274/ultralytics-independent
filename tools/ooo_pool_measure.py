@@ -48,7 +48,6 @@ def _synthetic(n: int, root: Path) -> Path:
 def build(n: int, ratios: dict, **extra):
     from ultralytics.cfg import get_cfg
     from ultralytics.data.build import build_yolo_dataset
-
     from ultralytics_ooo import install
 
     install()
@@ -111,7 +110,7 @@ def main() -> int:
                   f"keep_origin: one whole frame per SLICED image (un-selected ones already have one)")
             continue
         attr = "slice" if name == "base" else name
-        ratio_attr, on, count = spec[attr]
+        _ratio_attr, on, count = spec[attr]
         sel = getattr(ds, f"_sel_{attr}", None)
         n_sel, mult = (count, n_per if attr == "slice" else 2 if attr == "blur" else 1) if sel is None \
             else (len(sel), n_per if attr == "slice" else 2 if attr == "blur" else 1)

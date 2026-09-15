@@ -23,29 +23,34 @@ import pytest
 IMG_W, IMG_H = 64, 48  # non-square, so slicing geometry and ratio padding both do real work
 
 
-def _write_dataset(root, n=4):
-    """Write ``n`` tiny images + YOLO label files under ``root`` (images/train, labels/train)."""
+def _write_dataset(root, n=4, size=(IMG_W, IMG_H)):
+    """Write ``n`` tiny images + YOLO label files under ``root`` (images/train, labels/train).
+
+    ``size`` is only overridden by the byte-budget test, which needs frames large enough to hit an
+    integer-MiB budget: the raw LRU stores ORIGINAL-resolution frames.
+    """
     img_dir = root / "images" / "train"
     lbl_dir = root / "labels" / "train"
     img_dir.mkdir(parents=True, exist_ok=True)
     lbl_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
+    h, w = size[1], size[0]
     for i in range(n):
-        im = (rng.random((IMG_H, IMG_W, 3)) * 255).astype(np.uint8)
+        im = (rng.random((h, w, 3)) * 255).astype(np.uint8)
         cv2.imwrite(str(img_dir / f"img{i}.jpg"), im)
         # two boxes: one central, one in the lower-right quadrant
         (lbl_dir / f"img{i}.txt").write_text("0 0.50 0.50 0.20 0.20\n0 0.80 0.80 0.15 0.15\n", encoding="utf-8")
     return img_dir
 
 
-def _build(root, **overrides):
+def _build(root, size=(IMG_W, IMG_H), **overrides):
     """Build the installed dataset through the stock factory with the online branches configured."""
     from ultralytics.cfg import get_cfg
     from ultralytics.data.build import build_yolo_dataset
     from ultralytics_ooo import install
 
     install()  # idempotent: registers the project keys on DEFAULT_CFG
-    img_dir = _write_dataset(root)
+    img_dir = _write_dataset(root, size=size)
     cfg = get_cfg(overrides=dict(task="detect", mode="train", imgsz=64, batch=2, fraction=1.0, **overrides))
     data = {"path": str(root), "names": {0: "obj"}, "channels": 3, "nc": 1, "train": "images/train"}
     return build_yolo_dataset(cfg, str(img_dir), 2, data, mode="train")
@@ -616,18 +621,8 @@ def test_get_image_and_label_covers_the_whole_index_range(ds):
         _assert_common(ds.get_image_and_label(idx), f"index {idx}")
 
 
-def test_default_lru_keeps_grouping_and_an_oversized_lru_warns(tmp_path):
-    """The MEASURED LRU behaviour: the default cache keeps grouping; a bigger one destroys it.
-
-    Measured on a 24-image pool with every branch on (120 LRU reads/epoch):
-        grouped sampler ON, cache 4  -> 80.0% hit rate = the compulsory-miss ceiling (1 - N/reads)
-        grouped sampler ON, cache 8  -> 80.8% (noise) for 2x the resident RAM
-        cache > the busiest image's fan-out -> grouping is DISABLED -> 60.0% (shuffling interleaves
-        one image's slots with everyone else's decodes, so the LRU cannot keep them resident)
-
-    So raising ``slice_raw_cache_size`` past the fan-out makes decoding SLOWER, which is the exact
-    inversion nobody would guess. It must therefore warn instead of degrading silently.
-    """
+def _collect_logs():
+    """Attach a capturing handler to the ``ultralytics`` logger; returns (records, detach)."""
     import logging
 
     records = []
@@ -637,27 +632,146 @@ def test_default_lru_keeps_grouping_and_an_oversized_lru_warns(tmp_path):
             records.append(rec.getMessage())
 
     logger = logging.getLogger("ultralytics")
-    logger.addHandler(_H())
+    handler = _H()
+    logger.addHandler(handler)
+    return records, lambda: logger.removeHandler(handler)
+
+
+def test_grouping_is_kept_whatever_the_cache_size(tmp_path):
+    """A cache bigger than the busiest image's fan-out must NOT switch grouping off.
+
+    It used to: the guard was ``if fan_out < slice_raw_cache_size: warn + return None`` and told the
+    user to LOWER the cache. Its evidence (24-image pool: 80.0% -> 60.0% hit at cache 16 vs 4) came from
+    a pool no bigger than the Mosaic window, where the entire dataset fits in the cache and capacity
+    cannot matter, so it did not extrapolate. Measured at real scale (240 images, real DataLoader):
+    cache 16 grouped 41.0 items/s vs 16 shuffled 34.4, cache 32 grouped 44.3 vs 37.7 -- grouping wins
+    at the very cache size the guard refused it at. Units hold <= 4 images and are walked round-robin,
+    so the LRU only has to hold those <= 4 to absorb every re-read, which the floor of 4 guarantees.
+    """
+    records, detach = _collect_logs()
     try:
-        # 1) default: grouping must actually be produced, and nothing may be warned
-        ds = _build(tmp_path / "lru_ok", **ALL_ON)
-        ds.set_epoch(0, 10)
-        assert ds._raw_cache_size == 4, f"values <= 4 are floored to 4, got {ds._raw_cache_size}"
-        assert ds.grouped_sample_units() is not None, "grouping must pay off at the default LRU"
-        assert not [m for m in records if "fan-out" in m], records
-
-        # 2) oversized: grouping is refused, and it says why -- exactly once per dataset
-        ds2 = _build(tmp_path / "lru_too_big", **{**ALL_ON, "slice_raw_cache_size": 64})
-        ds2.set_epoch(0, 10)
-        assert ds2.grouped_sample_units() is None
-        assert ds2.grouped_sample_units() is None, "second call must stay silent (once per instance)"
+        for cap in (4, 16, 64):
+            ds = _build(tmp_path / f"lru_{cap}", **{**ALL_ON, "slice_raw_cache_size": cap})
+            ds.set_epoch(0, 10)
+            assert ds._raw_cache_size == cap, ds._raw_cache_size
+            units = ds.grouped_sample_units()
+            assert units is not None, f"grouping refused at slice_raw_cache_size={cap}"
+            flat = sorted(i for unit in units for blk in unit for i in blk)
+            assert flat == list(range(len(ds))), f"cache {cap}: the units are not a permutation"
     finally:
-        logger.handlers.pop()
+        detach()
+    blamed = [m for m in records if "fan-out" in m or "exceeds the busiest" in m]
+    assert not blamed, blamed
 
-    warned = [m for m in records if "fan-out" in m]
-    assert len(warned) == 1, f"expected exactly one warning, got {len(warned)}: {records}"
-    assert "slice_raw_cache_size=64" in warned[0], warned[0]
-    assert "WORSE" in warned[0], warned[0]
+
+def test_grouping_is_refused_when_no_image_owns_two_slots(tmp_path):
+    """The one condition that still disqualifies grouping: there is no re-read to absorb.
+
+    ``slice_all_tiles=False`` + ``slice_ratio=0.5`` + no ``img_origin`` gives 2 base slots for 4 images,
+    i.e. 1 slot per image. The pool IS wider than N (so the extended-pool gate passes) -- only the
+    fan-out test can refuse it, which is what this pins.
+    """
+    ds = _build(
+        tmp_path / "no_reuse",
+        slice_prob=1.0,
+        slice_all_tiles=False,
+        slice_ratio=0.5,
+        img_origin=False,
+        workers=0,
+    )
+    ds.set_epoch(0, 10)
+    assert ds._segment_lengths() == [2, 0, 0, 0, 0, 0, 0], ds._segment_lengths()
+    assert ds.grouped_sample_units() is None
+
+
+def test_grouping_survives_the_trainers_build_order(tmp_path):
+    """REGRESSION (silent, whole-run): the trainer builds the loaders BEFORE it publishes an epoch.
+
+    ``trainer._build_train_pipeline`` calls ``build_dataloader`` -- which asks the dataset for its units
+    via ``GroupedImageSampler.from_dataset`` -- while the only caller of ``set_epoch``,
+    ``on_train_epoch_start``, has not run yet. Every selection is therefore still the "all slots"
+    sentinel, and ``_sel_compose`` is ``None`` even when compose is OFF (its default). The old fan-out
+    rules read that sentinel unconditionally and emitted ``ceil(N/4)`` compose indices into a zero-wide
+    compose segment, so the permutation check failed and the whole run fell back to RandomSampler --
+    with a warning that blamed a "layout drift". Every test and tool called ``set_epoch`` first, so the
+    permutation check was the only thing that ever saw it.
+    """
+    records, detach = _collect_logs()
+    try:
+        # The shape that failed: all enabled ratios >= 1 (so _has_partial_ratio() is False and nothing
+        # ever corrects the sentinel), slicing on, compose off at its default ratio of 1.0.
+        ds = _build(
+            tmp_path / "trainer_order",
+            slice_prob=1.0,
+            slice_all_tiles=True,
+            slice_ratio=1.0,
+            img_origin=True,
+            workers=0,
+        )
+        assert ds._mask_stamp == -1, "the build published an epoch -- this test would be vacuous"
+        units = ds.grouped_sample_units()
+        assert units is not None, f"grouping dropped in the trainer's build order: {records}"
+        flat = sorted(i for unit in units for blk in unit for i in blk)
+        assert flat == list(range(len(ds))), "the units are not a permutation of the pool"
+
+        # ...and the same has to hold for the loader the trainer actually builds, without set_epoch.
+        from ultralytics.data.build import build_dataloader
+        from ultralytics_ooo.pool.sampler import GroupedImageSampler
+
+        loader = build_dataloader(ds, 2, 0, shuffle=True, rank=-1, pin_memory=False, device="cpu")
+        assert isinstance(loader.sampler, GroupedImageSampler), (
+            f"the real build_dataloader did not get the grouped sampler: {type(loader.sampler).__name__}"
+        )
+    finally:
+        detach()
+    drifted = [m for m in records if "drifted" in m or "grouping rules" in m or "Falling back" in m]
+    assert not drifted, drifted
+
+
+def test_the_raw_cache_default_covers_the_reuse_window(tmp_path):
+    """The default capacity must be sized for the window that actually repeats.
+
+    An image's slots are spread over the whole pool, so the only thing that re-reads is Mosaic's window
+    (``max_buffer_length`` pool slots) -- ~13-25 distinct images at the shipped batch sizes -- plus the
+    grouped sampler's unit (<= 4 images). The old default of 4 was set on a 24-image pool where the
+    window holds the whole dataset and capacity is irrelevant; measured at 240 images it costs +85%.
+    """
+    ds = _build(tmp_path / "lru_default", **ALL_ON)
+    ds.set_epoch(0, 10)
+    assert ds._raw_cache_size == 16, f"default capacity should cover the reuse window, got {ds._raw_cache_size}"
+    assert ds._raw_cache_mb == 256, ds._raw_cache_mb
+    assert ds._raw_cache_budget == 256 * (1 << 20)
+    # explicit overrides still work, and (0, 4) is still floored to 4
+    assert _build(tmp_path / "lru_floor", **{**ALL_ON, "slice_raw_cache_size": 1})._raw_cache_size == 4
+    assert _build(tmp_path / "lru_off", **{**ALL_ON, "slice_raw_cache_size": 0})._raw_cache_size == 0
+
+
+def test_the_raw_cache_byte_budget_caps_resident_frames(tmp_path):
+    """``slice_raw_cache_mb`` caps the frame count from above, so a large-frame dataset cannot be
+    sized into an OOM by ``slice_raw_cache_size`` alone.
+
+    The LRU holds ORIGINAL-resolution frames, whose size is unknown until the first decode, so the
+    budget is enforced on every insert. 640x640x3 frames are 1.17 MiB; a 3 MiB budget fits exactly two
+    of them, whatever ``slice_raw_cache_size`` says.
+    """
+    ds = _build(
+        tmp_path / "budget",
+        size=(640, 640),
+        slice_prob=1.0,
+        slice_all_tiles=True,
+        slice_ratio=1.0,
+        img_origin=True,
+        slice_raw_cache_size=16,
+        slice_raw_cache_mb=3,
+        workers=0,
+    )
+    ds.set_epoch(0, 10)
+    assert ds._raw_cache_budget == 3 * (1 << 20)
+    for i in range(len(ds)):
+        ds.get_image_and_label(i)
+    assert len(ds._raw_cache) == 2, f"3 MiB budget / 1.17 MiB frames -> 2 frames, got {len(ds._raw_cache)}"
+    assert ds._raw_cache_bytes == sum(v.nbytes for v in ds._raw_cache.values()), "the byte tally drifted"
+    assert ds._raw_cache_bytes <= ds._raw_cache_budget
 
 
 def test_slice_branch_never_hands_the_lru_buffer_downstream(tmp_path, monkeypatch):

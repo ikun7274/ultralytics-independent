@@ -824,6 +824,8 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # mirror the LRU capacity onto the dataset so it is self-describing (base.py consumes the same
     # hyp key directly in __init__, since this function runs too late for an eager read there).
     dataset.slice_raw_cache_size = int(_hyp_get(hyp, "slice_raw_cache_size") or 0)
+    # same for the byte budget that caps that frame count on large frames (0 = no byte limit).
+    dataset.slice_raw_cache_mb = float(_hyp_get(hyp, "slice_raw_cache_mb") or 0)
     # degradation resample kernel ("area" = antialiased/slower, "linear" = faster/slightly softer);
     # mirrored here because _degrade_frame reads it per-call from `self`.
     dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "linear")

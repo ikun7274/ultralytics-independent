@@ -76,7 +76,6 @@ def _build_dataset(data_yaml: Path, ratios: dict, args) -> object:
     """Build the training dataset through the stock factory with the online branches configured."""
     from ultralytics.cfg import get_cfg
     from ultralytics.data.build import build_yolo_dataset
-
     from ultralytics_ooo import install
 
     install()
@@ -133,7 +132,7 @@ def dry_run(data_yaml: Path, arms: dict[str, dict], args) -> None:
         ds = _build_dataset(data_yaml, ratios, args)
         n_orig = len(ds.labels)
         length_before = len(ds)  # what the trainer and the sampler see, BEFORE any epoch is published
-        msgs = _capture(lambda: ds.set_epoch(0, args.epochs))
+        msgs = _capture(lambda ds=ds: ds.set_epoch(0, args.epochs))
         summary = next((m for m in msgs if "augment masks @" in m), "<no summary>")
         print(f"--- arm '{label}': {', '.join(f'{k}={ratios[k]:g}' for k in RATIO_KEYS)} (+ slice/weather/"
               f"occlusion ratios 1.0)")
@@ -162,7 +161,6 @@ def dry_run(data_yaml: Path, arms: dict[str, dict], args) -> None:
 def _run_arm(data_yaml: Path, label: str, ratios: dict, args, run_dir: Path) -> Path | None:
     """Train one arm. Returns its results.csv path (or None)."""
     from ultralytics import YOLO
-
     from ultralytics_ooo import install
 
     install()
@@ -205,7 +203,7 @@ def _read_columns(csv_path: Path) -> tuple[list[str], list[dict]]:
         rows = list(csv.DictReader(fh))
     if not rows:
         return [], []
-    cols = [c.strip() for c in rows[0].keys()]
+    cols = [c.strip() for c in rows[0]]
     parsed = [{c.strip(): (v or "").strip() for c, v in row.items()} for row in rows]
     return cols, parsed
 
@@ -222,7 +220,7 @@ def compare(csv_paths: dict[str, Path]) -> None:
         return
     metric_cols = [
         c for c in tables[labels[0]][0]
-        if c.startswith("metrics/") or c.startswith("whole_metrics/") or c in {"train/box_loss", "train/cls_loss"}
+        if c.startswith(("metrics/", "whole_metrics/")) or c in {"train/box_loss", "train/cls_loss"}
     ]
     print("\n=== A/B metric comparison (best (max) over the run; losses shown as final (min-ish)) ===")
     header = f"{'column':<34}" + "".join(f"{lab:>16}" for lab in labels) + f"{'delta':>14}"

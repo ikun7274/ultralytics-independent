@@ -67,7 +67,6 @@ def _resolve(data_yaml: Path) -> tuple[Path, dict]:
 def build(train_dir: Path, data: dict, args, **over):
     from ultralytics.cfg import get_cfg
     from ultralytics.data.build import build_yolo_dataset
-
     from ultralytics_ooo import install
 
     install()

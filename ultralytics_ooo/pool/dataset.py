@@ -112,6 +112,13 @@ class OnlinePoolDataset(BaseDataset):
         self._raw_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", _online_default("slice_raw_cache_size")) or 0)
         self._raw_cache_size = max(4, _raw_cache_size) if _raw_cache_size > 0 else 0
+        # Byte budget for the same LRU (0 = unlimited). The cache holds ORIGINAL-resolution frames, so
+        # the frame count above cannot be turned into memory before the first decode; the budget is
+        # therefore enforced per insert in ``_load_image_cached``. It only ever BINDS the frame count
+        # from above -- 16 frames of a 4000x3000 frame would be 550 MiB/worker.
+        self._raw_cache_mb = float(getattr(hyp, "slice_raw_cache_mb", _online_default("slice_raw_cache_mb")) or 0)
+        self._raw_cache_bytes = 0
+        self._raw_cache_budget = int(self._raw_cache_mb * (1 << 20)) if self._raw_cache_mb > 0 else 0
         # Per-epoch branch SELECTIONS (see _rebuild_epoch_masks). Each is an ordered list of the
         # ORIGINAL image indices (group indices for compose) that this branch augments this epoch, with
         # its length -- K -- fixed by the CONFIGURED ratio, not by the draw. ``None`` is the "all slots"
@@ -1137,13 +1144,12 @@ class OnlinePoolDataset(BaseDataset):
             * ``n_per == 1`` and no extended segment -- every image maps to exactly ONE pool index, so
               there is no repeated decode to absorb, and a block-ordered stream would only narrow
               Mosaic's recent-sample window for no gain;
-            * no image is re-read more often than the LRU can already hold -- e.g. ``ratio_pad_keep``
-              alone gives 2 slots per image, where the deep ``ims`` cache absorbs the reuse.
+            * no image owns more than one slot this epoch -- same reason, computed from the fan-out
+              actually drawn below rather than from the switch list (a branch can be ON and still
+              select nothing, e.g. a ratio that rounds down to zero).
 
-        The last bullet is also why LOWERING ``slice_raw_cache_size`` (not raising it) is the fix when
-        grouping is off: a cache bigger than the busiest image's fan-out switches grouping off, and
-        plain shuffling then interleaves one image's decodes with everyone else's, so the hit rate
-        falls (measured 80.0% -> 60.0% at cache 16 vs 4). That case warns once -- see the guard below.
+        There is deliberately no OTHER disqualifying condition. In particular a cache larger than the
+        busiest image's fan-out does NOT switch grouping off: see the note above the fan-out test.
         """
         if not self.augment or self._raw_cache_size <= 0:
             return None
@@ -1154,58 +1160,71 @@ class OnlinePoolDataset(BaseDataset):
         self._ensure_epoch_sel()  # the fan-out below reads the selections; they must be drawn
         segment_bases = self._segment_bases()
         per_image: list[list[int]] = [[] for _ in range(n)]
+        # The branch gates are read from ``_mask_specs`` -- the SAME table ``_segment_lengths`` sizes the
+        # segments from -- instead of being re-derived here. That duplication is exactly what let
+        # compose fall out of this method's gate list while the other five branches kept theirs: a branch
+        # that is OFF owns zero slots, but its selection is still the ``None`` sentinel until an epoch is
+        # published, and ``_sel_indices`` turns ``None`` into ``range(count)``. That state is the NORMAL
+        # one at loader-construction time (the trainer builds the data loaders before the first
+        # ``on_train_epoch_start``), so the missing gate did not degrade grouping occasionally -- it
+        # killed it for the whole run, with a warning that blamed a layout drift. One table, one gate.
+        on = {attr: flag for attr, _ratio_attr, flag, _count in self._mask_specs(n)}
+        on["origin"] = self._img_origin_on()  # the coverage segment has its own switch, not a ratio
 
-        k_slice = self._ratio_K("slice_ratio", n, self._slice_on())
+        k_slice = self._ratio_K("slice_ratio", n, on["slice"])
         for pos, img in enumerate(self._sel_indices("slice", n)):
             if pos >= k_slice:
                 break  # defensive: _sel_indices is range(n) for "all", which is exactly k_slice == n
             per_image[img].extend(range(pos * n_per, (pos + 1) * n_per))
-        if self._img_origin_on():
+        if on["origin"]:
             # Unified coverage: one whole-frame slot per ORIGINAL image (offset == image index).
             for img in range(n):
                 per_image[img].append(segment_bases.origin + img)
-        if bool(getattr(self, "ratio_pad_keep", _online_default("ratio_pad_keep"))):
+        if on["ratio"]:
             for j, img in enumerate(self._sel_indices("ratio", n)):
                 per_image[img].append(segment_bases.ratio + j)
-        if bool(getattr(self, "blur_keep", _online_default("blur_keep"))):
+        if on["blur"]:
             for j, img in enumerate(self._sel_indices("blur", n)):
                 per_image[img].extend((segment_bases.blur + 2 * j, segment_bases.blur + 2 * j + 1))
-        if self._weather_on():
+        if on["weather"]:
             for j, img in enumerate(self._sel_indices("weather", n)):
                 per_image[img].append(segment_bases.weather + j)
-        if self._occlusion_on():
+        if on["occlusion"]:
             for j, img in enumerate(self._sel_indices("occlusion", n)):
                 per_image[img].append(segment_bases.occlusion + j)
 
-        # Only worth it when SOME image is re-read more often than the LRU can hold: an image with one
-        # slot has nothing to reuse, and if no image has more, grouping only narrows Mosaic's
-        # recent-sample window for no gain. The MAXIMUM (not the average) is the right statistic once
-        # the layout is ratio-sized -- an un-selected image owns exactly one slot by construction, so the
-        # average can be ~2.8 while the selected images own 10.
+        # --- the ONLY disqualifying condition: nothing to reuse ------------------------------------
+        # An image with a single slot has no repeated decode to absorb, and grouping it would only
+        # narrow Mosaic's recent-sample window for no gain.
+        #
+        # REMOVED GUARD: this used to be ``if fan_out < self._raw_cache_size: warn + return None``, i.e.
+        # a cache LARGER than the busiest image's fan-out switched grouping OFF. That compared the wrong
+        # two things -- "grouped sampler with a SMALL cache" against "plain shuffle with a BIG cache" --
+        # and then recommended LOWERING the cache. Its evidence (24-image pool, 80.0% -> 60.0% hit at
+        # cache 16 vs 4) came from a pool no bigger than the Mosaic window, where the entire dataset fits
+        # in the cache and capacity cannot matter; it does not extrapolate. Measured at real scale (240
+        # images, same test harness, real DataLoader): cache 16 grouped 41.0 items/s vs cache 16 shuffled
+        # 34.4; cache 32 grouped 44.3 vs 37.7 -- grouping wins at the very cache size the old guard
+        # switched it off at. Units hold <= 4 images and are walked round-robin, so every re-read of a
+        # unit's image hits as soon as the LRU holds those <= 4 images, which the documented floor
+        # (``slice_raw_cache_size >= 4``) guarantees. There is therefore no cache size at which turning
+        # grouping off is the better choice, so the guard is deleted rather than inverted.
         fan_out = max((len(b) for b in per_image), default=0)
-        if fan_out < self._raw_cache_size:
-            # LOWERING the LRU is the fix here, not raising it: past the busiest image's fan-out the
-            # cache already holds every slot of that image, and grouping is switched OFF -- but under
-            # plain shuffling one image's slots are interleaved with other images' decodes, so the LRU
-            # cannot keep them resident and the hit rate DROPS (measured 80.0% -> 60.0% at
-            # slice_raw_cache_size=16 vs 4, 24-image pool). Silently getting slower is exactly the
-            # failure mode this package keeps having, so say it once. Gated on fan_out >= 2: with
-            # fan_out == 1 there is no reuse to lose and the message would be noise.
-            if fan_out >= 2 and not getattr(self, "_lru_oversized_warned", False):
-                self._lru_oversized_warned = True
-                LOGGER.warning(
-                    f"{self.prefix}slice_raw_cache_size={self._raw_cache_size} exceeds the busiest "
-                    f"image's fan-out ({fan_out} slots/epoch), so grouped sampling is disabled and "
-                    f"decode locality gets WORSE, not better. Lower it to <= {fan_out} "
-                    "(the default 4 is usually best)."
-                )
+        if fan_out < 2:
             return None
 
         units: list[list[list[int]]] = []
         # Units are ALWAYS consecutive blocks of four images, so every image owns exactly one block
         # (no index can be emitted twice -- the check below enforces that).
         compose_base = segment_bases.compose
-        compose_slot = {g: compose_base + j for j, g in enumerate(self._sel_indices("compose", (n + 3) // 4))}
+        # compose is gated HERE too (see the ``on`` table above): with compose OFF its segment is zero
+        # slots wide, so an ungated lookup would hand out ``range(ceil(N/4))`` indices that land on / past
+        # the segments that follow and fail the count check below.
+        compose_slot = (
+            {g: compose_base + j for j, g in enumerate(self._sel_indices("compose", (n + 3) // 4))}
+            if on["compose"]
+            else {}
+        )
         for start in range(0, n, 4):
             blocks = [per_image[i] for i in range(start, min(start + 4, n))]
             slot = compose_slot.get(start // 4)
@@ -1221,11 +1240,21 @@ class OnlinePoolDataset(BaseDataset):
         flat = sorted(index for unit in units for block in unit for index in block)
         if flat != list(range(segment_bases.total)):
             # Falling back to the plain shuffle is always CORRECT (it still visits every index once),
-            # it only loses the decode-locality win -- so degrade loudly instead of crashing a run.
+            # it only loses the decode-locality win -- so degrade loudly instead of crashing a run. Name
+            # the branch whose selection disagrees with its own segment width: "the rules drifted" is
+            # true but tells the next reader nothing, and this failure is otherwise invisible (the run
+            # just gets slower).
+            drift = [
+                f"'{attr}': {len(self._sel_indices(attr, cnt))} indices for {self._ratio_K(ratio_attr, cnt, flag)} slots"
+                for attr, ratio_attr, flag, cnt in self._mask_specs(n)
+                if len(self._sel_indices(attr, cnt)) != self._ratio_K(ratio_attr, cnt, flag)
+            ]
             LOGGER.warning(
                 f"{self.prefix}grouped_sample_units produced {len(flat)} indices but the pool holds "
-                f"{segment_bases.total}: the pool layout and the grouping rules have drifted apart. "
-                f"Falling back to the plain shuffle; fix the grouping rules in base.py."
+                f"{segment_bases.total}: the grouping rules no longer mirror the pool layout"
+                + (f" (segment width vs selection: {'; '.join(drift)})" if drift else "")
+                + ". Falling back to the plain shuffle -- correct, but decoding gets slower. Fix the "
+                "fan-out rules in grouped_sample_units / _mask_specs."
             )
             return None
         return units
@@ -1282,9 +1311,11 @@ class OnlinePoolDataset(BaseDataset):
         hits = stats[0] - self._raw_reported[0]
         self._raw_reported = stats
         order = "grouped" if self.slice_grouped_sampler else "globally shuffled"
+        budget = f", budget {self._raw_cache_mb:.0f} MiB" if self._raw_cache_mb > 0 else ""
         LOGGER.info(
-            f"{self.prefix}raw-image LRU (slice_raw_cache_size={self._raw_cache_size}, {order} sampler): "
-            f"{hits / reads:.1%} hit on {reads} reads last epoch"
+            f"{self.prefix}raw-image LRU (slice_raw_cache_size={self._raw_cache_size}{budget}, "
+            f"{order} sampler): {hits / reads:.1%} hit on {reads} reads last epoch, "
+            f"{self._raw_cache_bytes / (1 << 20):.0f} MiB resident"
         )
 
     def _build_origin_sample(self, index: int, img_index: int) -> dict[str, Any]:
@@ -1351,8 +1382,9 @@ class OnlinePoolDataset(BaseDataset):
 
         Unified read path used by all online-augmentation branches (slice / blur / ratio /
         compose). Reads the original JPEG directly via ``imread``; a small in-memory LRU
-        (``slice_raw_cache_size``) absorbs repeated decoding of the same image across its
-        sub-samples. The custom .npy disk cache was removed -- it measured no benefit.
+        (``slice_raw_cache_size`` frames, additionally capped by the ``slice_raw_cache_mb`` byte budget)
+        absorbs repeated decoding of the same image across its sub-samples. The custom .npy disk cache
+        was removed -- it measured no benefit.
 
         Returns the image as a contiguous uint8 array with at least 3 dims (H, W, C); grayscale
         is expanded to (H, W, 1).
@@ -1390,10 +1422,16 @@ class OnlinePoolDataset(BaseDataset):
 
         if size > 0:
             self._raw_misses += 1
-            # Evict one entry at a time from the LRU end; no key-list materialisation per miss.
-            while len(cache) >= size:
-                cache.popitem(last=False)
+            # Evict from the LRU end until BOTH limits hold; no key-list materialisation per miss.
+            # ``>= 1`` keeps the just-decoded frame even if it alone exceeds the byte budget: a cache
+            # that evicts what it is about to store would decode this image again on its next slot,
+            # which is strictly worse than holding one oversized frame.
+            budget = self._raw_cache_budget
+            while cache and (len(cache) >= size or (budget and self._raw_cache_bytes + im.nbytes > budget)):
+                _old_key, old = cache.popitem(last=False)
+                self._raw_cache_bytes -= old.nbytes
             cache[img_index] = im
+            self._raw_cache_bytes += im.nbytes
             return im.copy() if copy else im
         return im
 
