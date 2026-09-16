@@ -562,6 +562,26 @@ def test_mask_summary_labels_ratio_1_as_all_augmented(tmp_path_factory):
     assert "compose all/1 (ratio 1)" in summary, summary  # compose is group-level: ceil(4/4) = 1
 
 
+def test_online_augment_header_names_the_slice_segment_sahi(tmp_path_factory):
+    """The construction header must call the slicing segment ``sahi``, not ``base``.
+
+    It used to print ``base``, which reads as "baseline / un-augmented" -- the exact opposite of what
+    that segment holds (the ``slice_transform`` tiles). The un-augmented whole frame is a separate
+    segment (``origin``), so the label invited the reader to think the sliced content and the plain
+    content were the same thing. Only the LABEL changed; the code keeps naming that segment ``base``
+    internally (``_segment_bases().base``, ``_base_slot()``), and the slot counts are untouched.
+    """
+    root = tmp_path_factory.mktemp("ddd_header")
+    messages = _capture_messages(lambda: _build(root, **ALL_ON))
+    header = next((m for m in messages if "Online augment:" in m), None)
+    assert header, f"the dataset constructor must report the pool layout: {messages}"
+    # N=4, all branches on: base 4*4, origin 4, ratio 4, blur 2*4, compose ceil(4/4), weather 4, occl 4
+    assert (
+        "(segment slots: sahi 16, origin 4, ratio 4, blur 8, compose 1, weather 4, occlusion 4)" in header
+    ), header
+    assert " base " not in header, f"the slice segment must be labelled 'sahi', not 'base': {header}"
+
+
 def test_ratio_rounding_to_zero_is_reported(tmp_path_factory):
     """A positive ratio that rounds to 0 selected images must warn instead of silently doing nothing."""
     root = tmp_path_factory.mktemp("ddd_round")

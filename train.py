@@ -58,7 +58,7 @@ if __name__ == '__main__':
         patience=0,
         amp=True,
         fraction=1.0,
-        project="runs",  # 相对工作目录, 便于仓库搬迁
+        project=r"C:\Users\Administrator\Desktop\ultralytics-main\runs", 
         name='exp',
 
         # ---------原图---------------
@@ -88,8 +88,8 @@ if __name__ == '__main__':
 
         # ---------在线合成 (compose_*): 每 4 张原图拼 1 张 2x2 大图, 提供更大范围多目标上下文--------- 
         compose_keep=True,  # 独立开关; 每 4 张原图额外合成 1 张 2×2 大图进样本池 (区段 +ceil(N/4))
-        compose_max_side=0, # 合成2x2大图拼后降采样最长边上限(像素): 0=自动=2×imgsz(默认开启, 降内存), >0=手动指定(如2560); 不想要此优化可设 compose_max_side 为一个很大的值关闭。
         compose_ratio=0.5,  # 每epoch随机选 round(x*ceil(N/4)) 组做合成(组级);  1.0=全量合成
+        compose_max_side=0, # 合成2x2大图拼后降采样最长边上限(像素): 0=自动=2×imgsz(默认开启, 降内存), >0=手动指定(如2560); 不想要此优化可设 compose_max_side 为一个很大的值关闭。
 
 
         # ---------在线比例调整 (ratio_pad_*): 在线加边框统一宽高比---------

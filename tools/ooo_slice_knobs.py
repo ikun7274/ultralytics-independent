@@ -6,10 +6,11 @@ The slicing knobs are a three-layer decision chain, and two of the layers are in
     slice_prob            the slicing MASTER GATE, so it takes booleans: True (= 1.0) / False (= 0.0).
                           Do NOT use 0 < p < 1 to "dial down" slicing: it coin-flips PER SLOT and the
                           losing slots fall back to the WHOLE image (the tool warns about it).
-    slice_all_tiles       True  -> 4 slots per selected image (the base segment is 4K + N-K wide)
-                          False -> 1 slot per selected image (base is K wide)
-    slice_ratio           per epoch, K = round(x * N) images take the slicing pipeline; the rest own
-                          exactly ONE whole-frame slot each.
+    slice_all_tiles       True  -> 4 slots per selected image (the sahi segment is 4K wide)
+                          False -> 1 slot per selected image (sahi is K wide)
+    slice_ratio           per epoch, K = round(x * N) images take the slicing pipeline. The sahi
+                          segment holds n_per*K slots for THOSE images only -- an un-selected image
+                          owns no slicing slot at all (its only path back into the pool is img_origin).
     slice_background_ratio  what an EMPTY tile becomes: kept as an empty tile while
                           ``empty <= x * positive`` (cumulative, per process, per epoch), otherwise
                           replaced by the WHOLE image. -1 keeps every empty tile.
@@ -20,7 +21,7 @@ The slicing knobs are a three-layer decision chain, and two of the layers are in
                           number that decides the largest repeat-free ``slice_ratio`` (queue / N).
     img_origin           adds one whole frame per ORIGINAL image (unified coverage knob).
 
-Run this before tuning. It classifies every base/origin slot and prints the density, so you can see
+Run this before tuning. It classifies every sahi/origin slot and prints the density, so you can see
 whether "most of my tiles are empty" is even true -- which is the single fact that decides the
 ``slice_background_ratio`` setting.
 
@@ -80,19 +81,19 @@ def build(train_dir: Path, data: dict, args, **over):
 
 
 def classify(ds) -> dict:
-    """Split the base + origin slots into positive tiles / kept empty tiles / whole frames."""
+    """Split the sahi + origin slots into positive tiles / kept empty tiles / whole frames."""
     ds.set_epoch(0, 10)
     lens = ds._segment_lengths()
     bounds = {}
     acc = 0
-    for name, ln in zip(("base", "origin", "ratio"), lens):
+    for name, ln in zip(("sahi", "origin", "ratio"), lens):
         bounds[name] = (acc, acc + ln)
         acc += ln
     shapes = {i: cv2.imread(f).shape[:2] for i, f in enumerate(ds.im_files)}
     stem_to_index = {Path(f).stem: i for i, f in enumerate(ds.im_files)}
 
     out = {"pos": 0, "empty": 0, "whole": 0}
-    for i in range(bounds["ratio"][0]):  # base + origin slots
+    for i in range(bounds["ratio"][0]):  # sahi + origin slots
         lab = ds.get_image_and_label(i)
         stem = Path(lab["im_file"]).stem
         idx = stem_to_index.get(stem)
@@ -114,7 +115,7 @@ def classify(ds) -> dict:
 def report(tag: str, r: dict, n_images: int) -> None:
     slots = r["pos"] + r["empty"] + r["whole"]
     pos_share = r["pos"] / slots if slots else 0.0
-    print(f"{tag:<26} pool={r['total']:>6}  base={r['lens'][0]:>6}  origin={r['lens'][1]:>5}  "
+    print(f"{tag:<26} pool={r['total']:>6}  sahi={r['lens'][0]:>6}  origin={r['lens'][1]:>5}  "
           f"K_slice={r['k_slice']:>4}/{n_images}")
     print(f"{'':<26} slots={slots:>6}  positive={r['pos']:>5} ({pos_share:5.1%})  "
           f"empty={r['empty']:>5}  whole={r['whole']:>5}")

@@ -28,7 +28,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-SEG_ORDER = ["base", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
+# Display names of the 7 segments, in layout order. "sahi" is the slice_transform tile segment, which the
+# code names "base" internally -- see the mapping in 更新说明.md 十四节. Positional: each label is mapped
+# back to its segment by index, so the order here must match _segment_lengths().
+SEG_ORDER = ["sahi", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
 RATIO_KEYS = ("slice_ratio", "ratio_pad_ratio", "blur_ratio", "compose_ratio", "weather_ratio",
               "occlusion_ratio")
 
@@ -105,18 +108,23 @@ def main() -> int:
         slots = lens[SEG_ORDER.index(name)]
         total += slots
         if name == "origin":
-            k_slice = len(ds._sel_indices("slice", n))
-            print(f"{name:<11}{slots:>8}{f'{k_slice}/{n}':>11}{'1':>11}   "
-                  f"keep_origin: one whole frame per SLICED image (un-selected ones already have one)")
+            # img_origin is an ALL-OR-NOTHING coverage layer, not a ratio-gated branch: it is N slots
+            # (one whole frame per ORIGINAL image) when on and 0 when off. Reporting it as "k/N" would
+            # wrongly tie it to the slice selection, so print all/N instead.
+            covered = n if slots else 0
+            print(f"{name:<11}{slots:>8}{f'{covered}/{n}':>11}{'1':>11}   "
+                  f"img_origin: one whole UN-SLICED frame per original image (N wide when on, 0 when off)")
             continue
-        attr = "slice" if name == "base" else name
+        attr = "slice" if name == "sahi" else name
         _ratio_attr, on, count = spec[attr]
         sel = getattr(ds, f"_sel_{attr}", None)
         n_sel, mult = (count, n_per if attr == "slice" else 2 if attr == "blur" else 1) if sel is None \
             else (len(sel), n_per if attr == "slice" else 2 if attr == "blur" else 1)
         note = ""
         if attr == "slice":
-            note = f"{n_sel} selected -> {n_per} tiles, {n - n_sel} un-selected -> 1 plain slot each"
+            # B+ removed the plain tail: an image slice_ratio did not select owns NO sahi slot at all.
+            # Its only path back into the pool is img_origin (the "origin" row above).
+            note = f"{n_sel} selected -> {n_per} tiles each; other {n - n_sel} own no slot here"
         elif not on:
             note = "branch off"
         elif n_sel == 0:
@@ -143,9 +151,9 @@ def main() -> int:
         print(f"  slots per source image: min={values[0]} max={values[-1]} "
               f"avg={sum(values) / len(values):.2f} distinct={len(values)}/{n}")
         print(f"  sources owning exactly ONE slot (i.e. plain originals only): {once}/{n}")
-        print("  (the pre-refactor layout gave every image n_per extra slots in the base segment even when")
-        print("   slicing did not select it -- 4 byte-identical copies at K=0. Now an un-selected image owns")
-        print("   one base slot and nothing else, so the only repetition left is genuine repetition: the")
+        print("  (the pre-refactor layout gave every image n_per extra slots in the sahi segment even when")
+        print("   slicing did not select it -- 4 byte-identical copies at K=0. Now the sahi segment holds")
+        print("   tiles for the SELECTED images only, so the only repetition left is genuine repetition: the")
         print("   selected images' tiles / tiers, which carry different pixels.)")
     return 0
 

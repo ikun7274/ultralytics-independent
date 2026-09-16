@@ -44,7 +44,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-SEG_ORDER = ["base", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
+# Display names of the 7 segments, in layout order. The first one is printed as "sahi" (the
+# slice_transform tiles) while the code keeps calling that segment "base" internally --
+# _segment_bases().base / _base_slot(). These names only label output (and key the JSON "segments"
+# block, which --compare deliberately ignores), so renaming them cannot move a boundary.
+SEG_ORDER = ["sahi", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
 RATIO_KEYS = ("slice_ratio", "ratio_pad_ratio", "blur_ratio", "compose_ratio", "weather_ratio",
               "occlusion_ratio")
 

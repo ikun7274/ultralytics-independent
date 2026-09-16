@@ -34,7 +34,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 PROC = psutil.Process()
-SEG = ["base", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
+# Display names of the 7 segments, in layout order; "sahi" is the slice_transform tile segment that the
+# code calls "base" internally. Positional: it is zipped against _segment_lengths().
+SEG = ["sahi", "origin", "ratio", "blur", "compose", "weather", "occlusion"]
 
 # Representative shapes of the pool. "A" is the inert baseline (every online switch off, so the pool
 # is the plain dataset plus the img_origin coverage segment); the rest turn one lever at a time.

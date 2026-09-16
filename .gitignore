@@ -216,3 +216,10 @@ fuzz-models/
 .workbuddy/
 __pycache__/
 *.pyc
+
+# Internal review docs (keep local, do not publish)
+*审查报告.md
+背景切片配额与原图回退机制说明.md
+样本池膨胀分析与方案.md
+在线切片参数与可视化坐标还原说明.md
+代码质量审查报告.md

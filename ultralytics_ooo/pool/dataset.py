@@ -204,7 +204,13 @@ class OnlinePoolDataset(BaseDataset):
         # only a few images, and N/4 compose even when compose_ratio selected no group at all.
         if self.augment:
             _lens = self._segment_lengths()
-            _names = ("base", "origin", "ratio", "blur", "compose", "weather", "occlusion")
+            # Display names for the 7 segments, in layout order. NOTE the first one is printed as "sahi"
+            # (Slicing Aided Hyper Inference) while the code keeps calling that segment "base" everywhere
+            # -- ``_segment_bases().base``, ``_base_slot()``, ``base_len``. They are the same thing: the
+            # tiles produced by the slice_transform pipeline. The log says "sahi" because "base" reads as
+            # "baseline / un-augmented", which is exactly what this segment is NOT -- the un-augmented
+            # whole frame lives in the "origin" segment instead.
+            _names = ("sahi", "origin", "ratio", "blur", "compose", "weather", "occlusion")
             LOGGER.info(
                 f"{self.prefix}Online augment: {sum(_lens)} training samples from {self.ni} images "
                 f"(segment slots: " + ", ".join(f"{nm} {ln}" for nm, ln in zip(_names, _lens)) + ")"
