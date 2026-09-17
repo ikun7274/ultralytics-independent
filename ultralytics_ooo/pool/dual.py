@@ -41,6 +41,16 @@ def _patch_plot_results():
     Stock plot_results builds a 2-row grid from the loss/metric column count; the dual-metric pass adds
     whole_* loss/metric columns, making the count odd and raising ``index out of bounds`` when it plots.
     We strip whole_* columns into a temp CSV and plot that; the whole metrics still live in results.csv.
+
+    The temp CSV has to live in a directory of its own, because upstream plots EVERY ``results*.csv`` it
+    globs next to ``file`` -- a sibling name such as ``results_no_whole.csv`` would be picked up twice.
+    That directory is also where upstream writes the FIGURE (``save_dir = Path(file).parent``), so the
+    PNG is moved back to the real run directory before the temp dir is removed. Without that the
+    figure was created in the temp dir and deleted with it: measured, a patched call left the run
+    directory with no ``results.png`` at all while the stock call produced one. ``on_plot`` is
+    deliberately NOT forwarded to the inner call -- upstream would report the temp path, which no
+    longer exists by the time the callback's consumers look at it -- and is invoked here with the final
+    path instead.
     """
     import ultralytics.engine.trainer as _t
     if getattr(_t, "_ooo_plot_patched", False):
@@ -62,7 +72,23 @@ def _patch_plot_results():
                 with tempfile.TemporaryDirectory(prefix="ooo_plot_") as tmpdir:
                     tmp = Path(tmpdir) / "results.csv"
                     df.select(keep).write_csv(tmp)
-                    return _orig(file=str(tmp), on_plot=on_plot)
+                    _orig(file=str(tmp), on_plot=None)  # figure lands in tmpdir (see docstring)
+                    produced = Path(tmpdir) / "results.png"
+                    if not produced.exists():
+                        # Nothing to rescue -- let upstream run its stock path so its own error/logging
+                        # behaviour (including the "no results*.csv" assertion) still applies.
+                        LOGGER.warning(
+                            "val_slice_dual_metric: the filtered results plot produced no figure; "
+                            "re-plotting the unfiltered CSV with the stock layout."
+                        )
+                    else:
+                        final = src.parent / "results.png"
+                        # write_bytes rather than move: shutil.move falls back to copy anyway, and this
+                        # keeps the temp dir removable even when it sits on another volume.
+                        final.write_bytes(produced.read_bytes())
+                        if on_plot:
+                            on_plot(final)
+                        return
         except Exception as e:  # noqa: BLE001
             LOGGER.warning(f"val_slice_dual_metric: plot wrapper fell back to stock ({e}).")
         return _orig(file=file, dir=dir, on_plot=on_plot)

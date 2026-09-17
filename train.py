@@ -57,7 +57,7 @@ if __name__ == '__main__':
         # resume_extend_epochs=15,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=0,
         amp=True,
-        fraction=1.0,
+        # fraction=1.0,
         project=r"C:\Users\Administrator\Desktop\ultralytics-main\runs", 
         name='exp',
 

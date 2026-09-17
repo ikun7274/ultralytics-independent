@@ -670,9 +670,15 @@ def test_no_switches_means_no_expansion_at_all(tmp_path_factory):
     """The zero-intrusion contract: with every online switch off the pool IS the plain dataset.
 
     ``install()`` must be completely inert unless a project switch is set -- same length, same index ->
-    image mapping, no extra segment, and (via ``_extended_pool_on``) the stock buffer bookkeeping. This
-    is the property that lets the package sit on a pristine Ultralytics, so it is asserted explicitly
-    rather than left implicit in "the defaults are off".
+    image mapping, no extra segment, and the STOCK mosaic-buffer rule. This is the property that lets
+    the package sit on a pristine Ultralytics, so it is asserted explicitly rather than left implicit in
+    "the defaults are off".
+
+    ``_extended_pool_on() is False`` is NOT sufficient for the buffer half: that flag gates
+    ``load_image``'s own branch, and the origin segment does not go through ``load_image`` at all. The
+    rule that has to hold is upstream's -- ``dataset.buffer`` gains an entry on a DECODE, never on a
+    visit -- and the second half of this test asserts it directly (see
+    ``test_a_cache_hit_does_not_feed_the_mosaic_buffer`` for the general shape of that rule).
     """
     root = tmp_path_factory.mktemp("ddd_off")
     ds = _build(root)  # no overrides at all
@@ -681,18 +687,63 @@ def test_no_switches_means_no_expansion_at_all(tmp_path_factory):
     # No slicing pipeline and no augmentation branch is on, BUT img_origin defaults to True for a
     # normal (non-rect/non-obb) train dataset, so every original lands in the ORIGIN segment (width N)
     # and the BASE segment holds zero slicing tiles. The pool is still exactly the N plain originals --
-    # total == n and _extended_pool_on() is False (stock buffer bookkeeping) -- so the zero-intrusion
-    # contract holds behaviourally; only the internal segment that carries the originals moved from the
-    # base plain tail (old behaviour) to the dedicated origin segment.
+    # total == n and _extended_pool_on() is False -- so the zero-intrusion contract holds behaviourally;
+    # only the internal segment that carries the originals moved from the base plain tail (old
+    # behaviour) to the dedicated origin segment.
     assert ds._segment_lengths() == [0, n, 0, 0, 0, 0, 0], ds._segment_lengths()
     assert len(ds) == n
     assert ds._n_per() == 1
-    assert ds._extended_pool_on() is False, "no segment extends the pool -> stock buffer bookkeeping"
+    assert ds._extended_pool_on() is False, "no segment extends the pool"
     assert [Path(ds.get_image_and_label(i)["im_file"]).name for i in range(n)] == [
         Path(f).name for f in ds.im_files
     ]
     for i in range(n):
         _assert_common(ds.get_image_and_label(i), f"index {i}")
+
+    # --- the buffer half of the same contract ---
+    # Re-reading an index that is still resident in the raw LRU is a HIT, and a hit must not append:
+    # upstream's append lives inside ``load_image``'s ``if im is None:``. The pre-fix code appended on
+    # every visit, so three extra reads of image 0 pushed three duplicates in and evicted real entries
+    # (measured on the 8-image set: 7 slots held 4 distinct images). Mosaic draws its partners from this
+    # buffer, so the duplicates displaced distinct images from the mix.
+    before = list(ds.buffer)
+    for _ in range(3):
+        ds.get_image_and_label(0)
+    assert list(ds.buffer) == before, (
+        f"a cache hit appended to the mosaic buffer: {before} -> {list(ds.buffer)}"
+    )
+
+
+def test_a_cache_hit_does_not_feed_the_mosaic_buffer(tmp_path_factory):
+    """The mosaic buffer tracks DECODES, not visits -- and ``len(buffer) <= ni`` on a warm pass.
+
+    ``Mosaic.get_indexes`` samples its partners from ``dataset.buffer``, so what is in there decides
+    which images get mixed. Upstream appends an image only when ``load_image`` really read the file
+    (the append sits inside ``if im is None:``); the pool reads through the raw LRU instead, and the
+    pre-fix package appended unconditionally. One pass over a 4-image pool therefore produced 41 appends
+    (every slot) instead of 4 (one per freshly decoded image), with duplicates crowding out the distinct
+    ones.
+    """
+    from collections import deque
+
+    root = tmp_path_factory.mktemp("ddd_buffer")
+    ds = _build(root, **ALL_ON)
+    ds.max_buffer_length = 1 << 20
+    ds.buffer = deque(maxlen=1 << 20)  # no eviction: the assertion is about appends, not capacity
+    ds.set_epoch(0, 10)
+    ni = len(ds.labels)
+
+    for i in range(len(ds)):
+        ds.get_image_and_label(i)
+
+    hits, misses = ds._raw_hits + ds.raw_cache_stats()[0], ds._raw_misses + ds.raw_cache_stats()[1]
+    assert misses >= ni, f"expected at least one decode per image, got {misses} misses"
+    assert hits > 0, "no LRU hit was exercised -- the check would be vacuous"
+    assert len(ds.buffer) <= ni, (
+        f"{len(ds.buffer)} appends for a {len(ds)}-slot pool over {ni} images -- visits are feeding the "
+        f"buffer again instead of decodes"
+    )
+    assert len(set(ds.buffer)) == len(ds.buffer), f"duplicate entries in the mosaic buffer: {list(ds.buffer)}"
 
 
 def test_get_image_and_label_covers_the_whole_index_range(ds):

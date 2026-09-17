@@ -194,18 +194,36 @@ class OnlinePoolDataset(BaseDataset):
             self._mp_raw_hits = None
             self._mp_raw_misses = None
         self._raw_reported = (0, 0)
-        # cache='ram' cannot serve the online branches (they read ORIGINAL-resolution frames).
-        # ``float(... or 0.0)`` also covers a bool (``True`` == 1.0, ``False`` -> ``0.0`` via ``or``); the
-        # AUTHORITATIVE read of slice_prob -- type normalisation, range check and the "0<p<1" warning --
-        # is ``augment_setup._resolve_slice_prob``, which has already run by now (it lives in
-        # ``v8_transforms``, called from ``build_transforms`` inside ``super().__init__()``). This site
-        # only needs the "is slicing on at all" bit, so it stays a plain comparison.
-        if self.cache == "ram" and float(getattr(hyp, "slice_prob", 0.0) or 0.0) > 0.0:
-            LOGGER.warning(
-                f"{self.prefix}cache='ram' cannot accelerate online slicing: degrading to cache=False. "
-                "Raise slice_raw_cache_size to speed up decoding instead."
-            )
-            self.cache = None
+        # ``cache`` cannot serve the mixed pool, and the gate is the LAYOUT, not slice_prob.
+        #
+        # Every pooled sample (origin, slicing tiles, and all five augmentation branches) is read at
+        # ORIGINAL resolution through the raw LRU, because ``self.ims`` holds imgsz-RESIZED frames -- it
+        # cannot be reused without corrupting ``ori_shape``. So the preloading that ``cache='ram'``/
+        # ``cache='disk'`` performs is paid for and then ignored: measured on a 4-image set with
+        # ``cache='ram'``, ``self.ims`` held all 4 frames and one full pass still decoded 4 times.
+        #
+        # This used to fire only for ``slice_prob > 0``, so the DEFAULT configuration (slicing off,
+        # ``img_origin`` on) silently wasted the RAM. Reading the layout instead covers every shape that
+        # can actually train: ``_segment_lengths()`` is non-empty exactly when some segment will read.
+        #
+        # ``cache='ram'`` is degraded (the mosaic buffer must stay live, or every sub-sample of an image
+        # would decode separately); ``cache='disk'`` only gets the notice, because turning it off would
+        # also stop the *.npy files from being written.
+        if self.augment and any(self._segment_lengths()):
+            if self.cache == "ram":
+                LOGGER.warning(
+                    f"{self.prefix}cache='ram' cannot accelerate the mixed sample pool: every pooled "
+                    "sample is read at ORIGINAL resolution through the raw-image LRU (self.ims holds "
+                    "imgsz-resized frames, so it cannot serve them). Degrading to cache=False; raise "
+                    "slice_raw_cache_size / slice_raw_cache_mb to speed up decoding instead."
+                )
+                self.cache = None
+            elif self.cache == "disk":
+                LOGGER.info(
+                    f"{self.prefix}cache='disk' *.npy files are written but NOT read by the mixed pool: "
+                    "pooled samples bypass load_image (and its npy lookup). The raw-image LRU is the "
+                    "cache that matters here -- tune slice_raw_cache_size / slice_raw_cache_mb."
+                )
         # Report the expanded sample count (train only). The per-branch breakdown is read straight off
         # ``_segment_lengths`` -- the same single source the pool is actually built from -- because the
         # static per-image wording this used to print ("4 slices + 1 ratio + ... per image") described
@@ -466,6 +484,11 @@ class OnlinePoolDataset(BaseDataset):
         simply has no blur / weather / occlusion / ratio / compose content in it. e.g. ``ratio=0.1``
         selects ``round(0.8) == 1`` on the shipped 8-image mini set but ``round(0.4) == 0`` on a 4-image
         set. A silent zero is the failure class this module keeps fighting, so say it out loud.
+
+        The advice is "``> 0.5``", NOT "``>= 0.5``": the draw uses Python's ``round()``, which rounds a
+        tie to EVEN, so ``round(0.5) == 0`` while ``round(1.5) == 2``. The reachable shape is compose on
+        a 4-image set (``count = ceil(4/4) = 1``, ``compose_ratio=0.5`` -> ``round(0.5) == 0``): the
+        segment is empty, which is exactly what this warning exists to announce.
         """
         if attr in self._ratio_zero_warned:
             return
@@ -473,8 +496,9 @@ class OnlinePoolDataset(BaseDataset):
         LOGGER.warning(
             f"{self.prefix}{ratio_attr}={x:g} selects round({x:g} x {count}) = 0 slots, so the '{attr}' "
             f"branch augments NOTHING for this dataset (its segment is empty and no sample of that kind "
-            f"reaches training). Raise {ratio_attr} so that {ratio_attr} x {count} >= 0.5, or turn the "
-            f"branch off via its *_keep switch if that is what you meant."
+            f"reaches training). Raise {ratio_attr} so that {ratio_attr} x {count} > 0.5 -- the draw uses "
+            f"round(), which rounds a tie 0.5 DOWN to 0 -- or turn the branch off via its *_keep switch "
+            f"if that is what you meant."
         )
 
     def _log_mask_summary(self, epoch: int, epochs: int | None) -> None:
@@ -897,6 +921,26 @@ class OnlinePoolDataset(BaseDataset):
         if self.augment and self.cache != "ram":
             self.buffer.append(index)
 
+    def _touch_buffer_for_decode(self, index: int, decoded: bool) -> None:
+        """Feed the mosaic buffer ONLY when this sample really decoded its source frame.
+
+        Upstream's rule is exactly that: ``self.buffer.append(i)`` sits inside ``load_image``'s
+        ``if im is None:`` branch (``ultralytics/data/base.py``), so a HIT -- which returns early from
+        ``self.ims`` -- does not append. The pool reads through the raw LRU instead of ``self.ims`` and
+        used to append unconditionally; measured on 8 images that turned the buffer from ``[0]`` /
+        ``[0,1,2,3]`` into ``[0,0,0,0]`` / ``[1,0,0,3,2,0,1]``, and 7 of 8 augmented samples differed
+        from upstream even with every project switch off.
+
+        ``Mosaic.get_indexes`` samples its partners from this buffer, so the duplicates were not
+        cosmetic -- they displaced DISTINCT images (at the measured point 7 slots held 4 distinct
+        images), which skews the mosaic mix towards whichever images Mosaic itself had just requested.
+
+        ``decoded`` is False on an LRU hit. With the LRU disabled (``slice_raw_cache_size=0``) every read
+        really decodes, so the flag is always True and the historical behaviour is preserved verbatim.
+        """
+        if decoded:
+            self._touch_buffer(index)
+
     def _remember_ims(self, i: int) -> None:
         """Record original index ``i`` in the ``self.ims`` FIFO, evicting the oldest entries.
 
@@ -972,19 +1016,24 @@ class OnlinePoolDataset(BaseDataset):
             state[0] = cnt + 1
             keys.add(key)
 
-    def _begin_branch_label(self, index: int, img_index: int) -> dict[str, Any]:
+    def _begin_branch_label(self, index: int, img_index: int, decoded: bool) -> dict[str, Any]:
         """Open a pooled branch sample: fresh label copy, ``im_file`` restored, mosaic buffer touched.
 
         Shared head of the online branches (blur / weather / occlusion). ``index`` is the EXPANDED
         mixed-pool index (for correct Mosaic buffer bookkeeping); ``img_index`` is the ORIGINAL image
-        index this sample derives from. The branch fills in the image and any label edits, then calls
-        ``_finish_branch`` / ``_save_branch``. This sequence used to be copy-pasted into every branch.
+        index this sample derives from; ``decoded`` is the source frame's decode flag, which gates the
+        buffer (see ``_touch_buffer_for_decode``). The branch fills in the image and any label edits,
+        then calls ``_finish_branch`` / ``_save_branch``. This sequence used to be copy-pasted into
+        every branch.
+
+        ``decoded`` is deliberately a REQUIRED parameter: defaulting it to True would let a future
+        branch silently reinstate the duplicate-append defect this argument exists to prevent.
         """
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)  # shape is for rect, remove it
         label["im_file"] = self.im_files[img_index]
         # Keep the sample on the same Mosaic mix pool as every other sample (cache != 'ram')
-        self._touch_buffer(index)
+        self._touch_buffer_for_decode(index, decoded)
         return label
 
     def _save_branch(self, branch: str, label: dict[str, Any], img: np.ndarray, *, save_dir, save_tag: str,
@@ -1354,8 +1403,8 @@ class OnlinePoolDataset(BaseDataset):
 
         The origin segment is laid out right after the base slicing segment (see _segment_bases) and
         behaves exactly like a plain full image in the mixed pool: LRU-backed read + training resize +
-        ratio_pad, and it enters the Mosaic mix pool (dataset.buffer) like every other sample.
-        Nothing is written to disk.
+        ratio_pad, and it enters the Mosaic mix pool (dataset.buffer) -- on a DECODE, not on every visit
+        (see ``_touch_buffer_for_decode``) -- like every other sample. Nothing is written to disk.
 
         It carries one slot per ORIGINAL image (offset into the segment == original image index) when
         ``img_origin`` is on -- the unified coverage knob that replaces the old per-slicing
@@ -1391,15 +1440,16 @@ class OnlinePoolDataset(BaseDataset):
         # -- ``_load_image_cached`` reads the JPEG directly and the npy cache was measured to add
         # nothing (see its docstring) -- but it does mean a dataset pre-baked to *.npy gets no benefit
         # for this segment.
-        im = self._load_image_cached(img_index)
+        im, decoded = self._load_image_cached_ex(img_index)
         # ``self.batch`` is indexed by IMAGE index (0..ni-1) and yields a batch id, so the ORIGINAL
         # index is the correct key here -- passing the expanded mixed-pool index would read past the
         # end of ``self.batch`` (and pick the wrong batch) as soon as online augmentation and rect
         # were ever allowed to coexist.
         if self.rect:
             label["rect_shape"] = self.batch_shapes[self.batch[img_index]]
-        # Keep the original on the same Mosaic mix pool as every other sample (cache != 'ram')
-        self._touch_buffer(index)
+        # Keep the original on the same Mosaic mix pool as every other sample (cache != 'ram'), but only
+        # when this visit really decoded the frame -- upstream's own rule (see _touch_buffer_for_decode).
+        self._touch_buffer_for_decode(index, decoded)
         return self._finalize_label(label, im)
 
     def _compose_on(self) -> bool:
@@ -1453,6 +1503,19 @@ class OnlinePoolDataset(BaseDataset):
         The contract: the caller must only READ the returned array -- never write into it, never
         hand it to something that writes. compose uses this, because it only copies its sources
         into a freshly allocated canvas.
+
+        This is the thin wrapper; the body lives in :meth:`_load_image_cached_ex`, which also reports
+        whether the call really decoded the file (see ``_touch_buffer_for_decode``).
+        """
+        return self._load_image_cached_ex(img_index, copy=copy)[0]
+
+    def _load_image_cached_ex(self, img_index: int, *, copy: bool = True) -> tuple[np.ndarray, bool]:
+        """``_load_image_cached`` plus the DECODE flag (``True`` = this call really read the file).
+
+        The flag exists for the mosaic buffer. Upstream appends an image to ``dataset.buffer`` only on a
+        genuine decode -- a cache hit returns early from ``self.ims`` and never reaches the append -- and
+        that is the rule ``_touch_buffer_for_decode`` reproduces on the expanded index space. Reporting
+        it from here is the only place that knows: the LRU hit/miss decision is made below.
         """
         # Per-worker LRU lookup (see __init__). Disabled when slice_raw_cache_size <= 0.
         size = self._raw_cache_size
@@ -1464,7 +1527,7 @@ class OnlinePoolDataset(BaseDataset):
                 # (a plain dict hit used to leave the entry in its original slot).
                 cache.move_to_end(img_index)
                 self._raw_hits += 1
-                return hit.copy() if copy else hit
+                return (hit.copy() if copy else hit), False
 
         f = self.im_files[img_index]
         im = imread(f, flags=self.cv2_flag)
@@ -1496,8 +1559,9 @@ class OnlinePoolDataset(BaseDataset):
                 self._raw_cache_bytes -= old.nbytes
             cache[img_index] = im
             self._raw_cache_bytes += im.nbytes
-            return im.copy() if copy else im
-        return im
+            return (im.copy() if copy else im), True
+        # LRU disabled: nothing was cached, so this read IS a decode and the caller must see that.
+        return im, True
 
     def _degrade_max_side(self) -> float:
         """Pixel cap applied to the degradation branches before they run.
@@ -1549,6 +1613,20 @@ class OnlinePoolDataset(BaseDataset):
         Scaling those parameters keeps the post-resize result near-identical to the uncapped path
         (measured mean|diff| = 2.11 / corr = 0.9982), because the final resize preserves the
         RELATIVE scale of the degradation; ``scale == 1.0`` means the frame was left untouched.
+
+        This is the two-value wrapper; the body lives in :meth:`_degrade_frame_ex`, which also forwards
+        the underlying read's decode flag so the branch can gate the mosaic buffer on it.
+        """
+        im, scale, _decoded = self._degrade_frame_ex(img_index)
+        return im, scale
+
+    def _degrade_frame_ex(self, img_index: int) -> tuple[np.ndarray, float, bool]:
+        """``_degrade_frame`` plus the decode flag of the LRU read behind it.
+
+        The flag has to come from here rather than from a second lookup at the call site: by the time a
+        branch reaches ``_begin_branch_label`` the read is long over, and re-deriving "was it a hit"
+        would need a second cache query whose answer the LRU has already changed (the frame was inserted
+        by this very call).
         """
         # The cap itself lives in _cap_long_side so compose can apply the same rule.
         # The cap itself lives in _cap_long_side so compose can apply the same rule. The kernel is
@@ -1556,7 +1634,9 @@ class OnlinePoolDataset(BaseDataset):
         # geometry is identical either way, only the resampling filter differs.
         resample = str(getattr(self, "degrade_resample", _online_default("degrade_resample")) or "linear")
         interp = cv2.INTER_LINEAR if resample == "linear" else cv2.INTER_AREA
-        return _cap_long_side(self._load_image_cached(img_index), self._degrade_max_side(), interp=interp)
+        im, decoded = self._load_image_cached_ex(img_index)
+        capped, scale = _cap_long_side(im, self._degrade_max_side(), interp=interp)
+        return capped, scale, decoded
 
     def _build_blur_sample(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
         """Build one in-memory motion-blurred image from a single original image (online port of the offline
@@ -1572,15 +1652,15 @@ class OnlinePoolDataset(BaseDataset):
         imgsz-capped 1280x960: 9.5 ms vs 52.4 ms, and 85 ms vs 451 ms uncapped at 4000x3000).
         Labels are UNCHANGED
         (blur does not move targets). The blurred image is resized to the training size like the other
-        branches and enters the Mosaic mix pool (dataset.buffer). Nothing is written to disk (save via
-        blur_save_dir).
+        branches and enters the Mosaic mix pool (dataset.buffer) on a DECODE. Nothing is written to disk
+        (save via blur_save_dir).
 
         ``index`` is the EXPANDED mixed-pool index (for correct Mosaic buffer bookkeeping);
         ``img_index`` is the ORIGINAL image index this blurred sample derives from.
         """
         # Degrade at the capped resolution (_degrade_frame), scaling the PSF with it so the result
         # after the resize to imgsz matches the original-resolution path (see _degrade_frame).
-        im, scale = self._degrade_frame(img_index)
+        im, scale, decoded = self._degrade_frame_ex(img_index)
         if long:
             lo = float(getattr(self, "blur_long_len_min", _online_default("blur_long_len_min")))
             hi = float(getattr(self, "blur_long_len_max", _online_default("blur_long_len_max")))
@@ -1610,7 +1690,7 @@ class OnlinePoolDataset(BaseDataset):
                 im, length=length, angle=angle, defocus_sigma=sigma * scale, axis_aligned=axis_aligned
             )
 
-        label = self._begin_branch_label(index, img_index)
+        label = self._begin_branch_label(index, img_index, decoded)
         # Optional save for visual inspection (blur_save_dir set). Annotated per slice_save_annotated,
         # capped by slice_save_max_blur (per-branch override; falls back to slice_save_max when the
         # per-branch cap is not set), deduplicated per (image, tier) across epochs.
@@ -1640,7 +1720,7 @@ class OnlinePoolDataset(BaseDataset):
         """
         # Degrade at the capped resolution; only the PIXEL-typed rain-line length scales with it
         # (haze_beta / noise_std are intensity quantities and therefore resolution-independent).
-        im, scale = self._degrade_frame(img_index)
+        im, scale, decoded = self._degrade_frame_ex(img_index)
         # weather_ratio: un-selected images own no slot in this segment; close_aug_epoch routes them back
         # to the plain original (see _build_blur_sample).
         if self._closing:
@@ -1658,7 +1738,7 @@ class OnlinePoolDataset(BaseDataset):
                 noise_std=float(getattr(self, "weather_noise_std", _online_default("weather_noise_std"))),
             )
 
-        label = self._begin_branch_label(index, img_index)
+        label = self._begin_branch_label(index, img_index, decoded)
         # Optional save for visual inspection (weather_save_dir set). Annotated per slice_save_annotated,
         # capped by slice_save_max_weather (falls back to slice_save_max), deduplicated per
         # (image, weather_type) across epochs.
@@ -1691,7 +1771,7 @@ class OnlinePoolDataset(BaseDataset):
         # parameters need no rescaling -- the occluders keep their relative size, and the boxes
         # returned in pixel space stay consistent because the coverage maths below uses this frame's
         # h/w.
-        im = self._degrade_frame(img_index)[0]
+        im, _scale, decoded = self._degrade_frame_ex(img_index)
         h, w = im.shape[:2]
         # occlusion_ratio: un-selected images own no slot in this segment; close_aug_epoch routes them
         # back to the plain original (see _build_blur_sample).
@@ -1710,11 +1790,23 @@ class OnlinePoolDataset(BaseDataset):
                 color=str(getattr(self, "occlusion_color", _online_default("occlusion_color")) or "auto"),
             )
 
-        label = self._begin_branch_label(index, img_index)
+        label = self._begin_branch_label(index, img_index, decoded)
         # max_cover: 目标被遮挡面积占比超过阈值 -> 从标签剔除 (完全被盖住的目标=纯噪声)
         max_cover = float(getattr(self, "occlusion_max_cover", _online_default("occlusion_max_cover")))
         if occluder_boxes and len(label.get("bboxes", [])):
             boxes = np.asarray(label["bboxes"], dtype=np.float64).copy()  # normalized xywh
+            cls_in = np.asarray(label.get("cls", np.empty((0, 1)))).reshape(-1)
+            if len(cls_in) != len(boxes):
+                # A malformed label (boxes and classes out of step) reached the masked indexing below
+                # and raised IndexError in the middle of a multi-hour run -- the same failure class the
+                # segments path below already warns about. Trim BOTH arrays to the common prefix so the
+                # bbox/cls invariant this method must preserve still holds, and say so.
+                n_align = min(len(cls_in), len(boxes))
+                LOGGER.warning(
+                    f"occlusion: {len(boxes)} boxes vs {len(cls_in)} cls for '{f}' -- aligning on the "
+                    f"first {n_align} entries and dropping the rest."
+                )
+                boxes, cls_in = boxes[:n_align], cls_in[:n_align]
             # covered 改为"块与目标框交集的并集面积"。旧实现逐块累加交叉面积,
             # 多个遮挡块相互重叠时重叠区被重复计入, 覆盖率虚高, 目标可能被提前按 max_cover
             # 误剔除。块数通常 1~3 且只对含目标的图执行, 布尔掩码开销可忽略。
@@ -1738,8 +1830,13 @@ class OnlinePoolDataset(BaseDataset):
                     keep[bi] = False
             if not keep.all():
                 label["bboxes"] = boxes[keep].astype(np.float32)
-                cls = np.asarray(label.get("cls", np.empty((0, 1))))
-                label["cls"] = np.asarray(cls).reshape(-1, 1)[keep].astype(np.float32) if len(cls) else cls
+                # ``cls_in`` is already length-matched to ``boxes`` (see the guard above), so this mask
+                # indexing cannot raise.
+                label["cls"] = (
+                    cls_in[keep].reshape(-1, 1).astype(np.float32)
+                    if len(cls_in)
+                    else np.empty((0, 1), dtype=np.float32)
+                )
                 segs = label.get("segments")
                 if segs:
                     # Index the segments with the SAME boolean mask as the boxes. The previous
@@ -1790,7 +1887,7 @@ class OnlinePoolDataset(BaseDataset):
         # pixel count and a 108 MB allocation) only for the result to be resized straight back down
         # to imgsz by ``_finalize_label``. All the pad maths is normalised, and the pad offset is
         # derived from this frame's w/h below, so padding a capped frame is equivalent.
-        im = self._degrade_frame(img_index)[0]
+        im, _scale, decoded = self._degrade_frame_ex(img_index)
         h, w = im.shape[:2]
         # ratio_pad_ratio: an un-selected image owns no slot in this segment (the segment is sized to the
         # ratio), so the only "skip the padding" case left is close_aug_epoch.
@@ -1867,8 +1964,9 @@ class OnlinePoolDataset(BaseDataset):
                 k = k[keep]  # keep keypoints aligned with the filtered boxes
             label["keypoints"] = k.astype(np.float32)
 
-        # Keep the ratio-padded image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        self._touch_buffer(index)
+        # Keep the ratio-padded image on the same Mosaic mix pool as every other sample (cache != 'ram'),
+        # but only when this visit really decoded the source frame (see _touch_buffer_for_decode).
+        self._touch_buffer_for_decode(index, decoded)
 
         # Optional save of the ratio-padded image for visual inspection (ratio_pad_save_dir set).
         # Annotated per slice_save_annotated, capped by slice_save_max_ratio (per-branch override,
@@ -1932,13 +2030,18 @@ class OnlinePoolDataset(BaseDataset):
             self._warn_cap_disabled("compose_max_side")
         half = max_side / 2.0 if max_side > 0 else 0.0  # <= 0 disables the cap (see _cap_long_side)
         imgs = []
+        any_decoded = False
         for i in idxs:
             # copy=False: each source is only READ here (it is memcpy'd into a canvas slice, or handed
             # to cv2.resize which returns a new array), so the worker-local LRU buffer it may alias is
             # never written to. This drops 4 full-resolution memcpys (~20 ms each at 4000x3000).
             # INTER_LINEAR (not the degradation branches' INTER_AREA): see _cap_long_side -- the box
             # path costs 40 ms/source here against 1.7 ms, and the pre-fix code was bilinear too.
-            im, _ = _cap_long_side(self._load_image_cached(i, copy=False), half, interp=cv2.INTER_LINEAR)
+            src, src_decoded = self._load_image_cached_ex(i, copy=False)
+            # This slot stands for FOUR sources, so it feeds the mosaic buffer when ANY of them really
+            # decoded -- that is the same "a fresh frame became available" event the other branches use.
+            any_decoded = any_decoded or src_decoded
+            im, _ = _cap_long_side(src, half, interp=cv2.INTER_LINEAR)
             imgs.append(im)
         # Unify sub-image size to the max in this group (stretching preserves normalized coords
         # linearly). W/H are the max over the ALREADY CAPPED group, so 2*W and 2*H are within
@@ -2030,8 +2133,9 @@ class OnlinePoolDataset(BaseDataset):
                 key=("compose", group),
             )
 
-        # Keep the composed image on the same Mosaic mix pool as every other sample (cache != 'ram')
-        self._touch_buffer(index)
+        # Keep the composed image on the same Mosaic mix pool as every other sample (cache != 'ram'),
+        # but only when at least one of its four sources really decoded (see _touch_buffer_for_decode).
+        self._touch_buffer_for_decode(index, any_decoded)
 
         # Resize to the training size (shared tail)
         return self._finish_branch(label, big)
@@ -2114,16 +2218,6 @@ class OnlinePoolDataset(BaseDataset):
         # pre-refactor layout. The independent origin segment (_build_origin_sample) never slices either
         # way and covers every original once when img_origin is on.
         slice_t = getattr(self, "slice_transform", None)
-        # The mosaic buffer is maintained centrally here using DATASET (expanded) indices whenever
-        # load_image does NOT self-manage it: slicing on, or any project extension on (load_image's
-        # self-managed path is only active in pure-ultralytics mode; mixing original indices from
-        # load_image with expanded indices here would corrupt the buffer).
-        if (
-            self.augment
-            and self.cache != "ram"
-            and (slice_t is not None or self._extended_pool_on())
-        ):
-            self._touch_buffer(index)
         if slice_t is not None and self.augment and sliced and not self._closing:
             # ``copy=False`` skips a full-resolution memcpy per slice call (measured 2.52 ms at
             # 1280x720 and 18.17 ms at 4000x3000, and ~80-90% of slice reads are LRU hits, so that is
@@ -2141,7 +2235,13 @@ class OnlinePoolDataset(BaseDataset):
             # pass-through (identity) and for an un-resized view, and skipped for every view that a
             # resize is about to replace anyway. With the LRU disabled nothing is cached, the array is
             # already exclusive, and the guard is skipped.
-            shared = self._load_image_cached(img_index, copy=False)
+            shared, decoded = self._load_image_cached_ex(img_index, copy=False)
+            # Feed the mosaic buffer with the DATASET (expanded) index -- load_image cannot, because in
+            # this shape it neither memoises into ``self.ims`` nor appends (mixing original indices from
+            # load_image with expanded ones here would corrupt the buffer). The entry is gated on the
+            # DECODE, so the four tiles of one image contribute ONE entry instead of four duplicates;
+            # see ``_touch_buffer_for_decode``. ``_touch_buffer`` itself keeps the augment / cache guards.
+            self._touch_buffer_for_decode(index, decoded)
             # A scheduled tile (slice_target_tiles) arrives exactly like an emit_all tile: the tile is
             # already decided, so slice_at is the right entry point and prefer_target lets it re-check
             # the choice against the LIVE grid when center_bias moved the seam. ``emit_all`` never sets
@@ -2176,6 +2276,11 @@ class OnlinePoolDataset(BaseDataset):
             # resize + imgsz clamp as load_image and every other online branch, so resized_shape/ratio_pad
             # can no longer drift (the old inline resize omitted the clamp).
             return self._finalize_label(label, im)
+        # Reached only during close_aug_epoch with slicing attached (``_base_slot`` always reports
+        # ``sliced=True``). ``load_image`` in that state neither memoises into ``self.ims`` nor appends
+        # to the buffer -- both live behind its ``slice_transform is None`` guard -- so this visit really
+        # decodes and the buffer entry is unconditional, exactly as it was before.
+        self._touch_buffer(index)
         # load_image indexes the ORIGINAL image files, so always use img_index (== index in the non-sliced
         # case); in emit_all mode index is the expanded (4K + N-K) sample index and would overflow.
         label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(img_index)

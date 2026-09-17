@@ -55,6 +55,13 @@ def patch_resume(trainer_cls) -> None:
             if ckpt.get("epoch", -1) < 0:
                 ckpt["epoch"] = finished_epoch - 1
             # Repair ckpt metadata: epochs + patience, keep epoch index.
+            #
+            # Scope note on ``patience``: this rewrites the value SAVED INSIDE the checkpoint, so the
+            # next resume reads the new one. It does NOT reach this run's early stopper -- ``_setup_train``
+            # builds ``EarlyStopping(patience=self.args.patience)`` on the line BEFORE it calls
+            # ``resume_training`` (engine/trainer.py), and ``self.args.patience`` is already the user's
+            # override by then (it IS on upstream's resume whitelist). So the two agree by construction;
+            # saying so here keeps the log from reading like a change to the current run.
             for key in ("train_args", "args"):
                 args = ckpt.get(key)
                 if args is None:
@@ -70,7 +77,8 @@ def patch_resume(trainer_cls) -> None:
             self._setup_scheduler()
             LOGGER.info(
                 f"[resume_extend] 自动修补 checkpoint 元数据: 已完成 {finished_epoch} 轮 -> "
-                f"续训至 {extend_epochs} 轮 (patience={self.args.patience})"
+                f"续训至 {extend_epochs} 轮 (改写 checkpoint 内保存的 epochs/patience="
+                f"{self.args.patience}; 本轮 EarlyStopping 已在 resume_training 之前按同一值构造)"
             )
         _orig_resume(self, ckpt)
 

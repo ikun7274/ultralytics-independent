@@ -86,7 +86,12 @@ model.train(
 model.train(resume="path/to/last.pt", resume_extend_epochs=200)
 ```
 
-不传任何 `slice_* / *_keep / resume_extend_epochs / val_slice_*` 时，行为与上游逐字节一致（全部默认关闭）。
+不传任何 `slice_* / *_keep / resume_extend_epochs / val_slice_*` 时，**训练行为**与上游一致：池恰为 `N` 张原图、段布局退化为 `[0, N, 0, 0, 0, 0, 0]`，样本内容逐字节相同（`_verify_probe/p1b_buffer_cause.py` 的 `upstream` / `installed` 两种模式给出 8/8 一致的摘要）。
+
+两处**内部状态**不同，都已在代码与文档里写明：
+
+- `self.ims` 是空的 —— 池内样本（含 origin 段）走原始分辨率的 raw LRU，这是第九轮定下的性能取舍；
+- 由此 `cache='ram'` / `cache='disk'` 对池内样本无效：`install()` 后 `cache='ram'` 会降级为 `cache=False` 并告警，`cache='disk'` 给一条 `INFO`（见 `更新说明.md` 第二十节 §20.4）。
 
 ## 工作原理
 
@@ -134,10 +139,10 @@ python -m pytest tests/ -k ooo -q
 | `tests/test_ooo_augment.py` | `OnlineSlice` / `_hyp_get` / `_compat` |
 | `tests/test_ooo_guards.py` | 切片几何不退化为 0 面积、构造期参数校验、`only=k` 等价性、配置表不覆盖上游键、**epoch 回调确实发布了 `set_epoch`** |
 | `tests/test_ooo_sampler.py` | 分组采样种子对齐上游、loader 属性与上游公式一致 |
-| `tests/test_ooo_branches.py` | 真实数据集端到端：7 区段总长、各分支标签结构、**ratio=1.0 布局逐位兼容旧形状**、ratio 定长切分、池长跨 epoch 恒定、`ratio=0` 边界、遮挡剔除、`close_aug_epoch` |
+| `tests/test_ooo_branches.py` | 真实数据集端到端：7 区段总长、各分支标签结构、**ratio=1.0 布局逐位兼容旧形状**、ratio 定长切分、池长跨 epoch 恒定、`ratio=0` 边界、遮挡剔除、`close_aug_epoch`、**无开关时池就是原数据集且 mosaic buffer 不会被缓存命中喂脏**、**buffer 只记录解码不记录访问** |
 | `tests/test_ooo_resume.py` | 修补续训 |
 | `tests/test_ooo_valslice.py` | 切片验证 |
-| `tests/test_ooo_dual.py` | 双口径跨 epoch 不退化为整图口径、`best_whole.pt` 判定、`last_whole.pt` 逐轮镜像、双开关都关时不产出整图文件、`final_eval` 确实 strip 了两个整图文件（用真 `strip_optimizer` 验证 fp16/optimizer=None/epoch=-1） |
+| `tests/test_ooo_dual.py` | 双口径跨 epoch 不退化为整图口径、`best_whole.pt` 判定、`last_whole.pt` 逐轮镜像、双开关都关时不产出整图文件、`final_eval` 确实 strip 了两个整图文件（用真 `strip_optimizer` 验证 fp16/optimizer=None/epoch=-1）、**剥掉 `whole_*` 后 `results.png` 仍落在 run 目录** |
 
 配套工具：
 
@@ -152,10 +157,11 @@ python -m pytest tests/ -k ooo -q
 
 - 已在 **Ultralytics 8.4.126**（干净原版）上端到端验证。
 - 所有与上游版本相关的构造差异（如 `Mosaic` 的 fork 调试参数）由 `_compat` 运行时按签名过滤，小版本间有一定容错。
-- **与上游实现对齐的三处**（改动前会静默偏离）：
+- **与上游实现对齐的四类**（改动前会静默偏离）：
   1. `GroupedImageSampler` 所在的 loader 尾部与上游 `build_dataloader` 逐项对齐（含 `+ seed` 与 npu/xpu 的 `pin_memory_device`），由 `tests/test_ooo_sampler.py` 锁死；
   2. `pool/constants.py` 的默认表**只保留上游没有的键**，`install()` 会自检是否与上游键撞车；
   3. epoch 回调通过 **`trainer.train_loader`** 取训练数据集（上游没有 `train_dataloader` 这个属性）。这一处曾长期静默失效：回调是空操作 → `set_epoch` 从未执行 → 每轮 ratio 抽样与 `close_aug_epoch` 全程冻结在第 0 轮，且没有任何报错。现在由 `tests/test_ooo_guards.py` 的两条测试（上游属性名 + 回调真的调到 `set_epoch`）守住，且回调注册按标记幂等，重复 `install()` 不会重复注册。
+  4. **mosaic buffer 的语义与上游一致：只在"真的解码了"时记账，不在"访问了"时记账**。上游的 append 在 `load_image` 的 `if im is None:` 里（命中 `self.ims` 时提前返回），而池内样本不走 `load_image`，于是曾经每次访问都 append —— `Mosaic.get_indexes()` 从这里抽混样伙伴，重复项会把不同的图挤出混样池。实测（8 张图）：上游 `[0]` / `[0,1,2,3]`，修复前 `[0,0,0,0]` / `[1,0,0,3,2,0,1]`，8 个样本里 7 个与上游内容不同。现由 `_touch_buffer_for_decode` 统一把关，`tests/test_ooo_branches.py` 两条测试 + `_perf_review/inject_check.py` 的一条注入守住。
 - 多 worker 走 Windows spawn：`InstalledYOLODataset` 必须保持在顶层可 import（已如此设计）；训练脚本需有 `if __name__ == "__main__"` 保护。
 - 仅支持 `task=detect` 的切片验证分支；`segment/pose/obb` 的 val 切片未接入。
 - `prefetch_factor` 是**真实生效**的配置键（默认 `4` = 上游硬编码值，即默认行为零变更）。它此前被读入 `dataset.prefetch_factor` 却从未被任何 loader 使用（上游硬编码 4），属于"传了没反应"的哑开关；第九轮把它接到了分组 loader 上。**作用域有限**：只在分组采样生效的训练路径上应用；走上游 `build_dataloader` 时（验证、多卡、`slice_grouped_sampler=False`）会**告警一次**说明它无法生效，而不是静默忽略。

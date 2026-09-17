@@ -31,6 +31,7 @@ Run: python -m pytest tests/test_ooo_dual.py -q
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -353,3 +354,70 @@ def test_final_eval_is_left_alone_without_dual_mode(tmp_path):
     trainer.save_model()
     trainer.final_eval()
     assert trainer.final_eval_calls == 1
+
+
+def test_the_filtered_results_plot_still_lands_in_the_run_directory(tmp_path):
+    """``results.png`` must survive the whole_*-stripping wrapper.
+
+    Upstream ``plot_results`` globs every ``results*.csv`` next to ``file`` AND writes the figure to
+    ``Path(file).parent``. The wrapper needs the glob to see ONLY the filtered CSV, so it plots a
+    temporary one -- and the figure therefore went into the temporary directory and was deleted with it.
+    Measured on a real dual-metric run: the run directory ended up with ``Box*_curve.png`` but no
+    ``results.png``, silently.
+
+    The assertion is on the file, deliberately: a return value or a "no exception" check passes on the
+    broken version too.
+    """
+    import shutil
+
+    from ultralytics_ooo.pool.dual import _patch_plot_results
+
+    _patch_plot_results()
+    import ultralytics.engine.trainer as _t
+
+    assert getattr(_t, "_ooo_plot_patched", False), "the plot wrapper is not installed"
+
+    run = tmp_path / "run"
+    run.mkdir()
+    # A realistic dual-metric results.csv: the column COUNT decides whether upstream's 2-row subplot
+    # grid is even, so a hand-made CSV can be degenerate in a way that makes both the patched and the
+    # stock call fail (and then the check would prove nothing).
+    header = (
+        "epoch,time,train/box_loss,train/cls_loss,train/l1_loss,metrics/precision(B),metrics/recall(B),"
+        "metrics/mAP50(B),metrics/mAP50-95(B),val/box_loss,val/cls_loss,val/l1_loss,"
+        "whole_metrics/metrics/precision(B),whole_metrics/metrics/recall(B),"
+        "whole_metrics/metrics/mAP50(B),whole_metrics/metrics/mAP50-95(B),whole_metrics/val/box_loss,"
+        "whole_metrics/val/cls_loss,whole_metrics/val/l1_loss\n"
+    )
+    (run / "results.csv").write_text(
+        header + "1,1.0,0.9,0.8,0.7,0.5,1.0,0.5,0.2,0.8,0.7,0.6,0.4,1.0,0.3,0.1,0.7,0.6,0.5\n",
+        encoding="utf-8",
+    )
+    assert not (run / "results.png").exists()
+
+    plotted: list = []
+    _t.plot_results(file=str(run / "results.csv"), on_plot=lambda name, data=None: plotted.append(Path(name)))
+
+    assert (run / "results.png").exists(), (
+        "the filtered plot wrote its figure into the temporary directory and deleted it"
+    )
+    assert (run / "results.png").stat().st_size > 0, "results.png is empty"
+    assert plotted and plotted[0].parent == run, f"on_plot reported {plotted}, expected the run dir"
+    assert (run / "results.csv").exists(), "the real results.csv must be left alone"
+
+    # and the stock reader is untouched: the whole_ columns are still in the CSV it was given
+    assert "whole_metrics/metrics/mAP50(B)" in (run / "results.csv").read_text(encoding="utf-8")
+
+    # contrast: re-plotting the SAME csv without stripping whole_* must still work (that is why the
+    # temporary copy exists at all), i.e. the wrapper is not simply bypassing the original path.
+    import polars as pl
+
+    from ultralytics.utils.plotting import plot_results as _stock
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    df = pl.read_csv(run / "results.csv", infer_schema_length=None)
+    df.select([c for c in df.columns if not c.startswith("whole_")]).write_csv(bare / "results.csv")
+    _stock(file=str(bare / "results.csv"))
+    assert (bare / "results.png").exists(), "the stock path itself no longer produces results.png"
+    shutil.rmtree(bare, ignore_errors=True)
