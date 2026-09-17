@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--cv-threads", type=int, default=0,
                     help="pin OpenCV's internal thread pool (0 = leave upstream default)")
+    ap.add_argument("--prefetch", type=int, default=0,
+                    help="DataLoader prefetch depth in batches/worker (0 = leave the configured default)")
     ap.add_argument("--out", default="")
     ap.add_argument("--list", action="store_true", help="print the known config keys and exit")
     a = ap.parse_args()
@@ -94,15 +96,29 @@ def main() -> None:
 
         cv2.setNumThreads(a.cv_threads)
 
-    import ultralytics_ooo.pool.dataset as D
-    from ultralytics.cfg import get_cfg
-    from ultralytics.data.build import build_dataloader, build_yolo_dataset
+    # install() MUST come before the builder is bound. ``from ultralytics.data.build import
+    # build_dataloader`` snapshots the function OBJECT, so doing it first silently kept the stock
+    # loader -- this tool then reported ``RandomSampler`` for every configuration, including the ones
+    # the project's GroupedImageSampler exists to accelerate, i.e. it could never measure the
+    # package's own headline optimisation. Reading the attributes off the module after install()
+    # picks up the patched function. Same for build_yolo_dataset: install() swaps the module-level
+    # ``YOLODataset`` name it resolves at call time, so the order matters less there, but keeping
+    # both uniform removes the trap.
     from ultralytics_ooo import install
 
     install()
+    import ultralytics.data.build as _build
+    from ultralytics.cfg import get_cfg
+
+    build_dataloader = _build.build_dataloader
+    build_yolo_dataset = _build.build_yolo_dataset
+    import ultralytics_ooo.pool.dataset as D
+
     data = yaml.safe_load((Path(a.root) / "data.yaml").read_text(encoding="utf-8"))
     data["path"] = a.root
-    extra = CONFIGS[a.key]
+    extra = dict(CONFIGS[a.key])
+    if a.prefetch > 0:
+        extra["prefetch_factor"] = a.prefetch
     out: dict = {"config": a.key, "imgsz": a.imgsz, "extra": extra,
                  "cv_threads": a.cv_threads or None,
                  "rss_base_mb": round(PROC.memory_info().rss / (1 << 20), 1)}
@@ -134,6 +150,9 @@ def main() -> None:
     dl = build_dataloader(ds, batch=a.batch, workers=0, shuffle=True, rank=-1)
     out["sampler"] = type(dl.sampler).__name__
     out["grouped_units"] = len(dl.sampler.units) if hasattr(dl.sampler, "units") else None
+    # Resolved prefetch depth, read off the DATASET: the loader only carries one when
+    # num_workers > 0 and this tool always builds at workers=0.
+    out["prefetch_factor"] = getattr(ds, "prefetch_factor", None)
 
     orig_imread = D.imread
     dec = {"n": 0, "b": 0}

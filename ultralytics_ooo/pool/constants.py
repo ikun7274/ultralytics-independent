@@ -126,6 +126,17 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "slice_raw_cache_mb": 256,
     "ims_cache_frames": 0,
     "ims_cache_mb": 1024,
+    # DataLoader prefetch depth, in BATCHES per worker. Stock build.py hardcodes 4 and offers no
+    # knob; the grouped loader tail copied that literal, so this key exists to make it settable.
+    #
+    # Why it matters: the prefetched batches are COLLATED float32 tensors, so the cost is
+    #     prefetch_factor x batch x channels x imgsz^2 x 4 B   per worker
+    # = 4 x 8 x 3 x 640^2 x 4 = 157 MiB at batch=8/imgsz=640, on top of the ~340 MiB of fixed
+    # per-worker overhead (spawn re-imports torch + cv2 and unpickles the dataset). Measured on a
+    # 7.9 GB box with ~0.4 GB free, that is what turns workers=4 into a DataLoader-worker
+    # MemoryError: 4 x (340 + 157) = ~2.0 GiB of workers alone, plus 240 MiB/worker of raw LRU.
+    # 4 is the stock value, so leaving the key alone reproduces upstream behaviour exactly.
+    "prefetch_factor": 4,
     # --- annotated-save knobs ---
     "slice_save_annotated": True,
     "slice_save_max": 0,

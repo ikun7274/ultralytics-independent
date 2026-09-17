@@ -482,9 +482,11 @@ def test_close_aug_epoch_keeps_the_ratio_sized_layout(tmp_path_factory):
     """close_aug_epoch must NOT move the layout: only the content changes, never the segment widths.
 
     Same reasoning as a mid-run selection change -- ``len(dataset)``, ``nb`` and the sampler's units are
-    fixed at training start. So the closing epochs keep every slot in place (identity selections) and
-    route each one back to the plain original, which costs a handful of duplicate originals in the final
-    epochs and nothing else.
+    fixed at training start. So the closing epochs keep every slot in place and route each one back to
+    the plain original of the image its slot selects.
+
+    What the selection still DOES decide is which images the window can reach at all, so the draw is not
+    short-circuited -- see test_close_aug_epoch_rotates_the_covered_subset.
     """
     root = tmp_path_factory.mktemp("ddd_close_sized")
     ds = _build(root, **{**ALL_ON, "close_aug_epoch": 2, "ratio_pad_ratio": 0.5, "blur_ratio": 0.5,
@@ -498,14 +500,72 @@ def test_close_aug_epoch_keeps_the_ratio_sized_layout(tmp_path_factory):
     assert ds._closing is True
     assert ds._segment_lengths() == sizes, "closing must not resize a segment"
     assert len(ds) == normal
-    # identity selections of the SAME length: no draw, but the slots still resolve
-    assert ds._sel_slice == [0, 1] and ds._sel_ratio == [0, 1]
+    # The selection keeps its ratio-sized LENGTH but is a real draw, not the fixed prefix range(K).
+    # This used to be asserted as ``_sel_slice == [0, 1]`` -- i.e. images 0 and 1 and nothing else,
+    # every closing epoch, which is exactly the coverage bug the next test guards.
+    n = len(ds.labels)
+    for attr in ("slice", "ratio"):
+        sel = ds._sel_indices(attr, n)
+        assert len(sel) == 2, f"{attr}: closing must keep the ratio-sized length, got {sel}"
+        assert len(set(sel)) == 2 and all(0 <= i < n for i in sel), f"{attr}: bad selection {sel}"
     for idx in range(len(ds)):
         lab = ds.get_image_and_label(idx)
         _assert_common(lab, f"closing index {idx}")
     # the ratio segment yields unpadded frames, the base segment un-tiled ones
     assert tuple(ds.get_image_and_label(ds._segment_bases().ratio)["ori_shape"]) == (IMG_H, IMG_W)
     assert tuple(ds.get_image_and_label(0)["ori_shape"]) == (IMG_H, IMG_W)
+
+
+def test_close_aug_epoch_rotates_the_covered_subset(tmp_path_factory):
+    """REGRESSION: the closing window must rotate WHICH images it covers, not freeze on a prefix.
+
+    The selection inside the closing window used to be ``list(range(K))`` -- the first K images by file
+    order. Because the images an epoch can see at all are the UNION of the per-branch selections, and
+    every image-level branch took that same prefix, the closing window reached exactly the first
+    ``max(K_x)`` images and nothing else, in EVERY closing epoch (``range(K)`` ignores the rng, so not
+    even the seed could move it). Measured at train.py's ratios (all 0.5) on the 8-image mini set: 4 of
+    8 images present with 7/6/6/6 slots each, the other 4 absent from the entire window.
+
+    Two properties separate the fix from the bug, and both are asserted here because either alone could
+    pass by luck on a given seed:
+      * the selection is not the same list every closing epoch;
+      * some closing epoch reaches an image OUTSIDE the first max(K).
+
+    ``close_aug_epoch=6`` with ``epochs=6`` makes every epoch a closing epoch, so the whole window is
+    observable. ``_perf_review/closing_probe.py`` reproduces the end-to-end version on the real mini set.
+    """
+    root = tmp_path_factory.mktemp("ddd_close_cov")
+    ratios = {"slice_ratio": 0.5, "ratio_pad_ratio": 0.5, "blur_ratio": 0.5, "compose_ratio": 0.5,
+              "weather_ratio": 0.5, "occlusion_ratio": 0.5}
+    ds = _build(root, **{**ALL_ON, **ratios, "close_aug_epoch": 6, "epochs": 6})
+    n = len(ds.labels)
+    k = n // 2
+    assert (n, k) == (4, 2), f"fixture changed shape: N={n}, K={k} -- the numbers below assume 4 and 2"
+    layout = ds._segment_lengths()
+
+    image_level = ("slice", "ratio", "blur", "weather", "occlusion")
+    seen_selections: set[tuple[int, ...]] = set()
+    unions: list[set[int]] = []
+    for epoch in range(6):
+        ds.set_epoch(epoch, 6)
+        assert ds._closing is True, f"epoch {epoch} should be inside the window"
+        assert ds._segment_lengths() == layout, f"epoch {epoch}: the fix must not move the layout"
+        covered: set[int] = set()
+        for attr in image_level:
+            sel = ds._sel_indices(attr, n)
+            assert len(sel) == k, f"epoch {epoch} {attr}: closing resized the selection to {sel}"
+            assert len(set(sel)) == k, f"epoch {epoch} {attr}: duplicate indices in {sel}"
+            assert all(0 <= i < n for i in sel), f"epoch {epoch} {attr}: out of range: {sel}"
+            covered |= set(sel)
+            seen_selections.add(tuple(sel))
+        unions.append(covered)
+
+    assert len(seen_selections) > 1, (
+        f"every closing epoch drew the SAME selection {seen_selections} -- that is the fixed-prefix bug"
+    )
+    assert any(c - set(range(k)) for c in unions), (
+        f"no closing epoch reached past the first {k} images; per-epoch unions: {unions}"
+    )
 
 
 def _capture_messages(fn):

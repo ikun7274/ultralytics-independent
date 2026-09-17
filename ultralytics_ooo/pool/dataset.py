@@ -119,6 +119,11 @@ class OnlinePoolDataset(BaseDataset):
         self._raw_cache_mb = float(getattr(hyp, "slice_raw_cache_mb", _online_default("slice_raw_cache_mb")) or 0)
         self._raw_cache_bytes = 0
         self._raw_cache_budget = int(self._raw_cache_mb * (1 << 20)) if self._raw_cache_mb > 0 else 0
+        # One-time report of the EFFECTIVE frame capacity (see _load_image_cached). The two caps are
+        # independent and only the byte one learns the real frame size, so the mismatch is otherwise
+        # invisible: at 4000x3000 a frame is 34.3 MiB, so the shipped 256 MiB budget holds 7 of the 16
+        # requested frames -- and raising slice_raw_cache_size to 32 would still hold exactly 7.
+        self._raw_cache_eff_logged = False
         # Per-epoch branch SELECTIONS (see _rebuild_epoch_masks). Each is an ordered list of the
         # ORIGINAL image indices (group indices for compose) that this branch augments this epoch, with
         # its length -- K -- fixed by the CONFIGURED ratio, not by the draw. ``None`` is the "all slots"
@@ -169,10 +174,14 @@ class OnlinePoolDataset(BaseDataset):
         self._ratio_zero_warned: set[str] = set()
         self._ratio_negative_warned: set[str] = set()
         self._save_state: dict[str, list] = {}
-        # NOTE: there is deliberately no `self.prefetch_factor` any more. It used to be computed here and
-        # read NOWHERE: the loader's prefetch_factor is hardcoded to 4 by stock build_dataloader (and by
-        # the grouped-sampler tail, matching it). A settable knob that never reached the loader silently
-        # ignored whatever the user passed, so prefetch_factor is no longer a registered key at all.
+        # NOTE: `self.prefetch_factor` is deliberately NOT set here. One knob, one writer: the augment
+        # assembly mirrors it onto the dataset (`augment_setup.v8_transforms` ->
+        # `dataset.prefetch_factor = _hyp_get(hyp, "prefetch_factor")`), and that has already run by now
+        # because it lives in build_transforms, called from super().__init__(). The grouped loader tail in
+        # pool/sampler.py is the only READER (`getattr(dataset, "prefetch_factor", ...)`). Scope reminder:
+        # it only takes effect on the grouped path -- stock build_dataloader hardcodes 4 and takes no
+        # argument for it -- so the sampler warns once when a non-default value cannot be applied instead
+        # of dropping it silently.
         self.slice_grouped_sampler = bool(
             getattr(hyp, "slice_grouped_sampler", _online_default("slice_grouped_sampler"))
         )
@@ -376,14 +385,30 @@ class OnlinePoolDataset(BaseDataset):
         self._closing = bool(
             aug_on and close_epoch > 0 and epochs is not None and epoch >= epochs - close_epoch
         )
+        # NOTE: the closing window deliberately does NOT skip the selection draw below.
+        #
+        # It used to publish ``_sel_* = list(range(K))`` here, reasoning that "no builder augments this
+        # epoch, so only the LENGTH of the selection has to match the layout". The LENGTH half was right;
+        # the rest was not. A slot in the closing window still resolves WHICH image it shows (every
+        # builder emits the plain original OF ITS SLOT'S IMAGE), and the set of images an epoch can see
+        # at all is the UNION of these per-branch selections. With every image-level branch taking the
+        # same ``range(K)`` prefix, that union was exactly the first ``max(K_x)`` images by file order --
+        # and the SAME prefix for every closing epoch, because ``range(K)`` ignores the rng entirely.
+        # MEASURED at train.py's ratios (all 0.5) on the 8-image mini set: 4 of the 8 images present
+        # (7/6/6/6 slots each), the other 4 absent from the whole window; see
+        # ``_perf_review/closing_probe.py`` and 更新说明.md §19.
+        #
+        # The draw below already produces exactly a rotation: ``sorted(rng.sample(range(count), K))``,
+        # seeded from ``f"{_mask_seed}:{epoch}:{epochs}"``, so it is reproducible in every worker and
+        # varies per epoch. Over a window of >= N/K epochs it reaches every image.
+        #
+        # The LAYOUT is still pinned while this runs -- it comes from ``_ratio_K`` (the CONFIGURED
+        # ratio), never from the draw, so ``len(dataset)`` cannot move. ``self._closing`` keeps doing its
+        # real work in the builders (emit the original), in ``_apply_target_tile_schedule`` (no
+        # scheduling) and in the base segment's slice gate.
         # --- 表驱动 : 六条增强分支共享同构的"选择集 = round(x*count) 张随机原图"逻辑。
         # 差异点只有: 开关谓词 / 比例属性 / 样本数 (compose 是组级 (n+3)//4, 其余原图级 n)。
         for attr, ratio_attr, on, count in self._mask_specs(n):
-            if self._closing:
-                # Identity selection: the content is irrelevant (no builder augments this epoch), only
-                # the LENGTH has to match the layout -- hence range(K) rather than a random draw.
-                setattr(self, f"_sel_{attr}", list(range(self._ratio_K(ratio_attr, count, on))))
-                continue
             if not on:
                 setattr(self, f"_sel_{attr}", [])  # branch off -> its segment holds no slots
                 continue
@@ -1328,7 +1353,7 @@ class OnlinePoolDataset(BaseDataset):
         """Build one un-sliced ORIGINAL-resolution sample (the unified img_origin segment).
 
         The origin segment is laid out right after the base slicing segment (see _segment_bases) and
-        behaves exactly like a plain full image in the mixed pool: load_image + training resize +
+        behaves exactly like a plain full image in the mixed pool: LRU-backed read + training resize +
         ratio_pad, and it enters the Mosaic mix pool (dataset.buffer) like every other sample.
         Nothing is written to disk.
 
@@ -1342,11 +1367,31 @@ class OnlinePoolDataset(BaseDataset):
         """
         label = deepcopy(self.labels[img_index])
         label.pop("shape", None)  # shape is for rect, remove it
-        label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(img_index)
-        label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
-        )  # for evaluation
+        # Read through the per-worker LRU instead of ``load_image``.
+        #
+        # ``load_image`` memoises NOTHING once slicing is on: its ``self.ims`` write sits behind
+        # ``getattr(self, "slice_transform", None) is None``, so with the slicing pipeline attached it
+        # skips the cache entirely (verified: ``ims_resident == 0`` in every slicing configuration).
+        # This segment therefore re-decoded the original JPEG *and* re-ran the training resize on every
+        # visit, even when the very same frame was already resident in the LRU for the image's other
+        # sub-samples. Measured exclusive share of the whole epoch: 15.1% on the full pool, 51.7% on
+        # the slice-one layout, 31.8% on 4000x3000 with slicing (0.517 reads/item x 119.7 ms).
+        #
+        # ``_load_image_cached`` returns the same ORIGINAL-resolution frame ``load_image`` decoded
+        # (copy=True, so the caller owns it), and ``_finalize_label`` applies the identical
+        # resize + imgsz clamp, so resized_shape / ratio_pad cannot drift from the load_image path.
+        #
+        # Trade-off, measured per read: on an LRU MISS this is SLOWER than load_image by one
+        # full-frame copy (2.52 ms at 1280x720, 18.17 ms at 4000x3000). It breaks even at a 44% hit
+        # rate at 1280x720 and 22% at 4000x3000 -- and the shipped grouped sampler delivers 0.90-0.95,
+        # so the net is a win on both sizes. Keep `slice_grouped_sampler` on (or raise
+        # `slice_raw_cache_mb`) if you turn grouping off, or this can invert on large frames.
+        #
+        # NOTE: this path no longer consults ``load_image``'s optional *.npy disk cache. That is safe
+        # -- ``_load_image_cached`` reads the JPEG directly and the npy cache was measured to add
+        # nothing (see its docstring) -- but it does mean a dataset pre-baked to *.npy gets no benefit
+        # for this segment.
+        im = self._load_image_cached(img_index)
         # ``self.batch`` is indexed by IMAGE index (0..ni-1) and yields a batch id, so the ORIGINAL
         # index is the correct key here -- passing the expanded mixed-pool index would read past the
         # end of ``self.batch`` (and pick the wrong batch) as soon as online augmentation and rect
@@ -1355,7 +1400,7 @@ class OnlinePoolDataset(BaseDataset):
             label["rect_shape"] = self.batch_shapes[self.batch[img_index]]
         # Keep the original on the same Mosaic mix pool as every other sample (cache != 'ram')
         self._touch_buffer(index)
-        return self.update_labels_info(label)
+        return self._finalize_label(label, im)
 
     def _compose_on(self) -> bool:
         """True when the compose branch allocates samples (switch on AND >= 4 originals).
@@ -1387,7 +1432,9 @@ class OnlinePoolDataset(BaseDataset):
         """Load original-resolution image, with a tiny per-worker memory LRU (no .npy disk cache).
 
         Unified read path used by all online-augmentation branches (slice / blur / ratio /
-        compose). Reads the original JPEG directly via ``imread``; a small in-memory LRU
+        compose / weather / occlusion) AND by the origin segment -- which used to go through
+        ``load_image`` and therefore bypassed this cache entirely once slicing was on, re-decoding
+        its frame on every visit (see ``_build_origin_sample``). Reads the original JPEG directly via ``imread``; a small in-memory LRU
         (``slice_raw_cache_size`` frames, additionally capped by the ``slice_raw_cache_mb`` byte budget)
         absorbs repeated decoding of the same image across its sub-samples. The custom .npy disk cache
         was removed -- it measured no benefit.
@@ -1433,6 +1480,17 @@ class OnlinePoolDataset(BaseDataset):
             # that evicts what it is about to store would decode this image again on its next slot,
             # which is strictly worse than holding one oversized frame.
             budget = self._raw_cache_budget
+            if budget and not self._raw_cache_eff_logged and im.nbytes > 0:
+                self._raw_cache_eff_logged = True
+                eff = max(1, min(size, int(budget // im.nbytes)))
+                if eff < size:
+                    LOGGER.info(
+                        f"{self.prefix}raw-image LRU: {size} frames requested, but a frame is "
+                        f"{im.nbytes / (1 << 20):.1f} MiB against a {budget / (1 << 20):.0f} MiB budget "
+                        f"-> {eff} frame(s) can be resident ({eff * im.nbytes / (1 << 20):.0f} MiB/worker). "
+                        f"slice_raw_cache_size cannot raise this; raise slice_raw_cache_mb (or lower it "
+                        f"deliberately) if the decode reuse is not enough."
+                    )
             while cache and (len(cache) >= size or (budget and self._raw_cache_bytes + im.nbytes > budget)):
                 _old_key, old = cache.popitem(last=False)
                 self._raw_cache_bytes -= old.nbytes
@@ -2067,17 +2125,22 @@ class OnlinePoolDataset(BaseDataset):
         ):
             self._touch_buffer(index)
         if slice_t is not None and self.augment and sliced and not self._closing:
-            # ``copy=False`` skips a full-resolution memcpy per slice call (measured ~20 ms at
-            # 4000x3000, and ~80% of slice reads are LRU hits, so that is most of them). It is sound
-            # ONLY because the slice transforms never write into their input: ``_emit`` copies the tile
-            # out with ``ascontiguousarray``. Three paths do hand the INPUT back unchanged though --
-            # the ``p`` coin flip and the degenerate-size guard in ``__call__``/``slice_at``, plus
-            # ``_emit``'s background-quota Plan A fallback -- and those would leak the LRU's own buffer
-            # upward into the affine/mosaic transforms, which the ``copy=True`` default exists to
-            # protect. Rather than thread a "was it shared?" flag through four call sites, detect it by
-            # IDENTITY: only those pass-through paths can return the object we passed in, so copy in
-            # exactly that case. With the LRU disabled nothing is cached, the array is already
-            # exclusive, and the guard is skipped.
+            # ``copy=False`` skips a full-resolution memcpy per slice call (measured 2.52 ms at
+            # 1280x720 and 18.17 ms at 4000x3000, and ~80-90% of slice reads are LRU hits, so that is
+            # most of them). It is sound ONLY because nothing in the slice pipeline writes into its
+            # input: ``_emit`` hands out a VIEW of the ROI (not a contiguous copy -- see its comment)
+            # and the transforms only read it; the resize that follows allocates its own output.
+            #
+            # Three paths DO return the object we passed in unchanged -- the ``p`` coin flip and the
+            # degenerate-size guard in ``__call__``/``slice_at``, plus ``_emit``'s background-quota
+            # Plan A fallback -- and those would leak the LRU's own buffer upward into the
+            # affine/mosaic transforms, which the ``copy=True`` default exists to protect. A fourth
+            # case is a view: when the tile's long side is already ``imgsz`` the shared resize tail
+            # becomes a no-op and the view itself would flow on. Rather than thread a "was it shared?"
+            # flag through four call sites, detect both by MEMORY SHARING: the copy is taken for a
+            # pass-through (identity) and for an un-resized view, and skipped for every view that a
+            # resize is about to replace anyway. With the LRU disabled nothing is cached, the array is
+            # already exclusive, and the guard is skipped.
             shared = self._load_image_cached(img_index, copy=False)
             # A scheduled tile (slice_target_tiles) arrives exactly like an emit_all tile: the tile is
             # already decided, so slice_at is the right entry point and prefer_target lets it re-check
@@ -2091,7 +2154,22 @@ class OnlinePoolDataset(BaseDataset):
                 )
             else:
                 im, label = slice_t(shared, label, src=img_index, count=count_slice, key=img_index)
-            if self._raw_cache_size > 0 and im is shared:
+            if self._raw_cache_size > 0 and (
+                im is shared or (max(im.shape[:2]) == self.imgsz and np.shares_memory(im, shared))
+            ):
+                # Never let an LRU-backed array reach a writer. The identity test alone only covered
+                # the first of the two leaks that exist now:
+                #   * a PASS-THROUGH returns ``shared`` ITSELF -- the ``p`` coin flip, the
+                #     degenerate-size guard, and ``_emit``'s background-quota Plan A fallback;
+                #   * a TILE is a VIEW of ``shared`` (see OnlineSlice._emit), and this shared resize
+                #     tail hands that view straight on whenever its own resize will NOT run -- i.e.
+                #     when the tile's long side is already exactly ``imgsz``, because
+                #     ``np.ascontiguousarray`` returns an already-contiguous view unchanged and a
+                #     downstream in-place transform (affine / mosaic) would then write into the cache.
+                # When the resize DOES run it is safe by construction: ``cv2.resize`` always allocates
+                # its own output. That is exactly why the view case is copied only in the no-resize
+                # branch -- copying every view would reinstate the full-resolution memcpy that the
+                # view change exists to remove (measured 8.9 ms per tile at 4000x3000).
                 im = im.copy()
             # reuse the shared tail instead of a third hand-rolled resize. The sliced sub-image
             # becomes the new "original" for downstream transforms; _finalize_label applies the exact same

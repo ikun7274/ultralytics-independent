@@ -179,18 +179,38 @@ def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.1
     if weather_type == "haze":
         t = max(0.0, min(1.0, 1.0 - haze_beta))
         return cv2.convertScaleAbs(img, alpha=t, beta=200.0 * (1.0 - t))
-    # noise: cv2.randn into ONE float32 buffer; handed a single-channel view so sigma is not scaled
+    # noise: cv2.randn into ONE scratch buffer; handed a single-channel view so sigma is not scaled
     # by 1/sqrt(3); one integer pulled from the numpy stream seeds OpenCV's RNG to keep lockstep.
+    #
+    # The scratch is int16, not float32: the result is quantised straight back to uint8, so the
+    # float32 frame only bought 2x the write traffic for the RNG and two extra full-frame
+    # allocations (the float buffer plus the float->uint8 result). Measured on this project's own
+    # hardware via _perf_review/noisebench.py, medians of 7: 1280x720 29.59 -> 25.31 ms (-14%),
+    # 1280x960 36.43 -> 34.31 ms, and the realised sigma is unchanged (14.98 for both at sigma=15).
+    # The same file rejected the obvious numpy alternatives: Generator.normal into int16 measured
+    # 47.90 (single-channel broadcast) / 78.46 (per-channel) ms and into a float32 out 50.56 ms,
+    # i.e. 1.6-2.7x SLOWER than the shipped kernel -- do not "simplify" this into numpy.
     sigma = max(0.0, float(noise_std))
     cv2.setRNGSeed(int(np.random.randint(0, 2**31 - 1)))
-    out = np.empty(img.shape, dtype=np.float32)
+    if img.ndim != 3:  # single-channel: the int16 path below is only worth it for 3-channel frames
+        out_f = np.empty(img.shape, dtype=np.float32)
+        if sigma > 0:
+            cv2.randn(out_f.reshape(out_f.shape[0], -1), 0.0, sigma)
+        else:
+            out_f.fill(0.0)
+        out_f += img
+        np.clip(out_f, 0, 255, out=out_f)
+        return out_f.astype(np.uint8)
+    scratch = np.empty(img.shape, dtype=np.int16)
     if sigma > 0:
-        cv2.randn(out.reshape(out.shape[0], -1), 0.0, sigma)
+        cv2.randn(scratch.reshape(scratch.shape[0], -1), 0.0, sigma)
+        # cv2.add saturates into dst, so no explicit clip is needed for the add itself; the clip
+        # below still matters because int16 addition of a >255 noise excursion can undershoot 0.
+        cv2.add(img.astype(np.int16), scratch, dst=scratch, dtype=cv2.CV_16S)
     else:
-        out.fill(0.0)
-    out += img
-    np.clip(out, 0, 255, out=out)
-    return out.astype(np.uint8)
+        scratch[...] = img
+    np.clip(scratch, 0, 255, out=scratch)
+    return scratch.astype(np.uint8)
 
 
 # --- Occlusion ---------------------------------------------------------------

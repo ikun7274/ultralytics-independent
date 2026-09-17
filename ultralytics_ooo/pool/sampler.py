@@ -9,6 +9,8 @@ from typing import Iterator, NamedTuple
 import torch
 from torch.utils.data import Sampler
 
+from ultralytics.utils import LOGGER
+
 from .constants import _online_default
 
 
@@ -90,6 +92,29 @@ class GroupedImageSampler(Sampler[int]):
                         yield block[k]
 
 
+_PREFETCH_WARNED = False
+
+
+def _warn_prefetch_ignored(value: int) -> None:
+    """Say ONCE that a non-default ``prefetch_factor`` cannot reach the stock loader.
+
+    The stock ``build_dataloader`` hardcodes ``prefetch_factor=4`` and takes no argument for it. When
+    grouping is off we fall through to that function, so honouring the key would mean re-implementing
+    the whole stock tail a second time -- more upstream-drift surface for a knob that matters mainly
+    on the grouped path. Warning keeps it from becoming a silent no-op instead, which is the failure
+    class the rest of this module is written to avoid.
+    """
+    global _PREFETCH_WARNED
+    if _PREFETCH_WARNED:
+        return
+    _PREFETCH_WARNED = True
+    LOGGER.warning(
+        f"prefetch_factor={value} cannot be applied: the stock build_dataloader hardcodes 4 and the "
+        f"grouped sampler is not active for this dataset (enable slice_grouped_sampler, or accept the "
+        f"stock depth). Reduce `batch` if the prefetched tensors are the memory problem."
+    )
+
+
 def patch_build_dataloader() -> None:
     """Redirect stock ``build_dataloader`` to use GroupedImageSampler on single-machine training.
 
@@ -112,7 +137,14 @@ def patch_build_dataloader() -> None:
             # constant and args.seed no longer changed augmentation randomness at all.
             seed = torch.initial_seed() - int(_b.RANK) - 1
             grouped = GroupedImageSampler.from_dataset(dataset, seed=seed)
+        # Prefetch depth, in batches per worker. Resolved for BOTH branches so a mis-set value is
+        # reported rather than silently ignored (see _warn_prefetch_ignored).
+        prefetch = int(getattr(dataset, "prefetch_factor", _online_default("prefetch_factor")) or 4)
+        if prefetch < 1:
+            prefetch = 1
         if grouped is None:
+            if prefetch != 4:
+                _warn_prefetch_ignored(prefetch)
             return _orig(dataset, batch, workers, shuffle, rank, drop_last, pin_memory, device)
 
         # Grouped sampler active: mirror the stock build_dataloader tail but pass sampler=grouped.
@@ -149,7 +181,7 @@ def patch_build_dataloader() -> None:
             shuffle=False,  # sampler is supplied; stock requires shuffle=False when sampler is set
             num_workers=nw,
             sampler=grouped,
-            prefetch_factor=4 if nw > 0 else None,
+            prefetch_factor=prefetch if nw > 0 else None,
             pin_memory=pin_memory,
             collate_fn=getattr(dataset, "collate_fn", None),
             worker_init_fn=_b.seed_worker,

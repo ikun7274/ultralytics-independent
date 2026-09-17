@@ -50,9 +50,9 @@ if __name__ == '__main__':
         imgsz=320,
         epochs=2,
         batch=4,
-        workers=0,                   
+        workers=2,
         optimizer='MuSGD',
-        device='cpu',
+        device="cpu",
         # resume=r'C:\Users\Administrator\Desktop\ultralytics-improved\runs\exp-3\weights\last.pt',  # 断点续训: 改成你本机 last.pt 路径
         # resume_extend_epochs=15,  # (int, 0=关闭) 续训自动延长: 自动修补ckpt元数据(epochs/patience), 从旧停点续训到该轮数; 需>ckpt已完成轮数
         patience=0,
@@ -60,6 +60,7 @@ if __name__ == '__main__':
         fraction=1.0,
         project=r"C:\Users\Administrator\Desktop\ultralytics-main\runs", 
         name='exp',
+
 
         # ---------原图---------------
         img_origin=False, # 是否在样本池里多增加1份原图参与训练            
@@ -144,7 +145,10 @@ if __name__ == '__main__':
         val_slice_overlap_ratio=0.2,  # 验证侧切片重叠比例 [0,1), 建议与训练侧 slice_overlap_ratio 一致
         val_slice_nms_iou=0.5,        # 跨切片重复框 NMS 融合 IoU 阈值
         val_slice_dual_metric=True,   # 双口径: 先跑切片验证(主, 驱动 fitness/早停/best.pt), 再跑整图验证(参考),
-                                      #         输出 whole_* 指标并额外保存 best_whole.pt/last_whole.pt (耗时为两遍验证)
+                                      #         输出 whole_* 指标并额外保存 best_whole.pt + last_whole.pt (耗时为两遍验证)
+                                      #         这两个整图文件在收尾时与 best/last 一样被 strip 成 fp16 推理快照
+                                      #         注: last_whole.pt 与 last.pt 内容等价(权重相同)但非逐字节相同
+                                      #             (zip 条目前缀带文件名, torch.save 本就不保证字节可复现)
 
         
         # ---- 在线增强保存 (人工检查切片是否正确) ----

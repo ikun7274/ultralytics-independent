@@ -13,7 +13,7 @@
 | **每轮分支选中数日志** | 主进程每 epoch 打印各分支实际选中的原图数，配置与行为不一致时一眼可见 | 自动（`LOGGER.info`） |
 | **修补续训** | resume 已训完的 ckpt 时自动修补元数据续训到更长总轮数 | `resume_extend_epochs` |
 | **切片验证** (SAHI eval) | val 时把大图切子块分别推理，预测 remap 回原图 + 类别级 NMS 融合 | `val_slice_enable` |
-| **双口径 mAP** | 每轮跑切片(主)+整图(副)两遍；主 fitness 选 `best.pt`，副 fitness 另存 `best_whole.pt` | `val_slice_dual_metric` |
+| **双口径 mAP** | 每轮跑切片(主)+整图(副)两遍；主 fitness 选 `best.pt`/`last.pt`，副 fitness 另存 `best_whole.pt`/`last_whole.pt`（两个整图文件在收尾时同样被 strip 成 fp16 推理快照） | `val_slice_dual_metric` |
 | **分组采样** | 让同一原图的所有子样本连续进出，raw LRU 命中、避免重复解码 | `slice_grouped_sampler`(默认开) |
 
 ## 样本池布局：`*_keep` 开关占不占位，`*_ratio` 定段长
@@ -115,7 +115,7 @@ ultralytics_ooo/
     sampler.py          # GroupedImageSampler + patch_build_dataloader
     resume.py           # resume_extend_epochs
     valslice.py         # SliceValDataset + DetectionValidator patch
-    dual.py             # val_slice_dual_metric 双口径 + best_whole.pt
+    dual.py             # val_slice_dual_metric 双口径 + best_whole.pt / last_whole.pt + 收尾 strip
     fraction.py         # fraction 舍入为 0 的兜底
     constants.py        # 在线超参默认表（仅项目自有键）
 ```
@@ -137,7 +137,7 @@ python -m pytest tests/ -k ooo -q
 | `tests/test_ooo_branches.py` | 真实数据集端到端：7 区段总长、各分支标签结构、**ratio=1.0 布局逐位兼容旧形状**、ratio 定长切分、池长跨 epoch 恒定、`ratio=0` 边界、遮挡剔除、`close_aug_epoch` |
 | `tests/test_ooo_resume.py` | 修补续训 |
 | `tests/test_ooo_valslice.py` | 切片验证 |
-| `tests/test_ooo_dual.py` | 双口径跨 epoch 不退化为整图口径、`best_whole.pt` 判定 |
+| `tests/test_ooo_dual.py` | 双口径跨 epoch 不退化为整图口径、`best_whole.pt` 判定、`last_whole.pt` 逐轮镜像、双开关都关时不产出整图文件、`final_eval` 确实 strip 了两个整图文件（用真 `strip_optimizer` 验证 fp16/optimizer=None/epoch=-1） |
 
 配套工具：
 
@@ -158,4 +158,95 @@ python -m pytest tests/ -k ooo -q
   3. epoch 回调通过 **`trainer.train_loader`** 取训练数据集（上游没有 `train_dataloader` 这个属性）。这一处曾长期静默失效：回调是空操作 → `set_epoch` 从未执行 → 每轮 ratio 抽样与 `close_aug_epoch` 全程冻结在第 0 轮，且没有任何报错。现在由 `tests/test_ooo_guards.py` 的两条测试（上游属性名 + 回调真的调到 `set_epoch`）守住，且回调注册按标记幂等，重复 `install()` 不会重复注册。
 - 多 worker 走 Windows spawn：`InstalledYOLODataset` 必须保持在顶层可 import（已如此设计）；训练脚本需有 `if __name__ == "__main__"` 保护。
 - 仅支持 `task=detect` 的切片验证分支；`segment/pose/obb` 的 val 切片未接入。
-- 已移除 `prefetch_factor` 配置键：它此前被读入 `dataset.prefetch_factor` 但**从未被任何 loader 使用**（上游硬编码 4），属于"传了没反应"的哑开关。现在传入会直接报未知参数，而不是静默忽略。
+- `prefetch_factor` 是**真实生效**的配置键（默认 `4` = 上游硬编码值，即默认行为零变更）。它此前被读入 `dataset.prefetch_factor` 却从未被任何 loader 使用（上游硬编码 4），属于"传了没反应"的哑开关；第九轮把它接到了分组 loader 上。**作用域有限**：只在分组采样生效的训练路径上应用；走上游 `build_dataloader` 时（验证、多卡、`slice_grouped_sampler=False`）会**告警一次**说明它无法生效，而不是静默忽略。
+
+## 迁移到另一个 Ultralytics（新版本 / 新环境）
+
+本包靠**重绑上游已存在的名字**工作（不编辑上游源码），代价是：上游一旦改名或挪动符号，补丁**不会报错，只会静默失效**。本项目已经因此栽过一次——epoch 回调读的是 `trainer.train_dataloader`，而 `BaseTrainer` 从来没有这个属性，于是 `set_epoch`、连同每轮 `*_ratio` 抽签与 `close_aug_epoch`，在整个项目生命周期内冻结在第 0 轮且不打印任何东西。
+
+所以迁移的正确顺序是：**先自检，再训练。**
+
+### 第 0 步：跑迁移自检
+
+```bash
+python tools/ooo_compat_check.py          # 人类可读报告，任一项 FAIL 则退出码 1
+python tools/ooo_compat_check.py --out res.json   # 同时落一份机器可读结果
+```
+
+它检查四层，共约 63 项，离线、不下载权重：
+
+| 层 | 内容 | 失败意味着 |
+|---|---|---|
+| **A** 上游符号存在性 | `install()` 重绑的 29 个 `模块.属性` 是否仍可解析 | 上游改名/挪模块 → 对应补丁静默失效 |
+| **B** 签名 / 调用契约 | 被包装函数的**前导参数名与顺序**、`BaseDataset.__init__` 的 `hyp`/`fraction` 关键字、`BaseTrainer.train_loader` 属性名、`final_eval` 是否还在 | 转发参数会被错位解释，且多半不报错 |
+| **C** `install()` 生效性 | 打完补丁后逐个核对标记位（`_ooo_sampler_patched` 等）与身份（`is` 判等）、整图 strip 包装是否真的落上（`_ooo_final_eval_wrapper`）、以及项目自有键是否真的注册到了 `DEFAULT_CFG` | 补丁没落上、或在线超参根本没进配置 |
+| **D** 端到端冒烟 | 真实 4 图数据集走真实工厂：7 段池几何、池层标签契约、变换后样本、分组采样器类别、epoch 回调真的调到 `set_epoch` | 装得上但跑起来不对 |
+
+**不要靠"没报错"判断成功**：A/B 只能告诉你"名字还在"，C/D 才是"补丁真的做了事"的证据。这个检查器自身也做过注入验证（4 类失败模式全部被捕获，脚本在 `_perf_review/compat_inject.py`）。
+
+### 第 1 步：搬哪些文件
+
+| 路径 | 必要性 | 说明 |
+|---|---|---|
+| `ultralytics_ooo/` | **必需** | 15 个 `.py` + `ruff.toml`。含 `core/`（纯 numpy/cv2，零 ultralytics 依赖）与 `pool/`（所有触碰上游的代码与补丁） |
+| `tools/ooo_compat_check.py` | **强烈建议** | 上一步的自检器；换环境后第一件事 |
+| `tools/ooo_*.py`（其余） | 可选 | 池布局诊断 / 旋钮体检 / 性能测量 |
+| `tests/test_ooo_*.py` | 可选 | 11 个文件，**需放进新仓库的 `tests/` 目录**（它们用上游的 `tests/conftest.py`） |
+| `train.py` / `_mini_val_set/` | 参考 | 使用示例与最小数据集，不是包的一部分 |
+| 上游 `ultralytics/` | **不要动** | 零侵入是本包的设计前提；改上游会让后续升级无法合并 |
+
+本包**没有独立的构建配置**（`ultralytics_ooo/` 下只有 `ruff.toml`，没有 `pyproject.toml` / `setup.py`），所以它是"随源码走"而不是 `pip install` 的包。三种搬法：
+
+```bash
+# (a) 整仓沿用（最省事）：新环境里直接用这份仓库，只把 ultralytics 升级/替换
+#     注意：若 pip 里另有一个 ultralytics，而仓库根在 sys.path 前面，用的是仓库这份。
+
+# (b) 只带扩展包：把 ultralytics_ooo/ 复制到新仓库根目录，保证仓库根在 sys.path
+#     目录名必须保持 ultralytics_ooo（worker 靠重新 import 这个名字反序列化数据集）
+
+# (c) 想 pip 安装：需要自己补一个 build 配置（本包未提供），
+#     且构建产物里的包名必须仍是 ultralytics_ooo
+```
+
+### 第 2 步：三条时序契约（违反会静默失效或直接报错）
+
+1. **`install()` 必须在任何 `YOLO(...).train(...)` 之前**。在线超参是在 `install()` 时注册到运行时 `DEFAULT_CFG` 的；先 `train()` 会撞上 `check_dict_alignment` 并报 `not a valid YOLO argument`。
+
+2. **`install()` 必须早于"按名字导入" `build_dataloader`**。这是本项目踩过的坑，模板如下：
+
+   ```python
+   from ultralytics.data.build import build_dataloader   # ← 绑定了补丁前的函数，永久失效
+   from ultralytics_ooo import install
+   install()
+   ```
+
+   正确写法是**在 `install()` 之后从模块属性取**：
+
+   ```python
+   from ultralytics_ooo import install
+   install()
+   from ultralytics.data import build as B   # 此时 B.build_dataloader 才是补丁版
+   dl = B.build_dataloader(ds, batch, workers, True, -1, False, True, "cpu")
+   ```
+
+   自带工具 `tools/ooo_perf_run.py` 曾长期因此报 `RandomSampler`，让人误判"分组采样没效果"。
+
+3. **不要依赖"多调一次没关系"**。`install()` 本身按标记幂等，但若发生 `sys.modules` 清理后重新 import，或环境里存在两份包副本，epoch 回调会被注册两次——**每轮的 `*_ratio` 抽签会跑两遍**。自检 C 层会断言回调恰好一个。
+
+### 第 3 步：训练脚本的两个形态要求
+
+- **Windows 走 spawn 多进程**：训练脚本必须有 `if __name__ == "__main__":` 保护，否则 worker 重新 import 主模块会递归启动。`InstalledYOLODataset` 已刻意放在顶层模块，就是为了让 worker 能反序列化到它。
+- **`workers` 受内存约束**：每个 spawn worker 固定约 340 MB，外加预取批次与原始图 LRU。在 7.9 GB 的机器上 `workers=4` 会直接 `MemoryError`；`workers<=2` 才稳。别照抄大内存机器上的 `workers=8`。
+
+### 第 4 步：按自检失败的那一层定位
+
+| 层 | 症状 | 通常要改 |
+|---|---|---|
+| A FAIL | 符号找不到 | 该行 `->` 指出的文件；上游把函数挪了模块或改了名 |
+| B FAIL | 参数名/顺序变了 | 同上；重点看 `pool/sampler.py`（分组 loader 尾部是**故意重复**上游写法的）与 `pool/valslice.py` |
+| B WARN | `Mosaic` 现在带 `**kwargs` | `_compat` 的过滤失效，检查 fork-only 调试参数是否被原样转发 |
+| C WARN | 键表与上游撞车 | `pool/constants.py`：把上游也已定义的键从 `_ONLINE_DEFAULTS` 删掉，让上游保持唯一真源 |
+| D FAIL | 装上了但跑不对 | 池几何看 `pool/dataset.py`；采样器看 `pool/sampler.py`；变换看 `pool/augment_setup.py` |
+
+**已知验证版本：`8.4.126`（干净原版）**。小版本间有一定容错（`_compat` 按签名过滤差异），但**每换一次上游版本都要重跑自检**，把上面那张表当作准入清单。
+

@@ -69,11 +69,17 @@ def run(root: str, imgsz: int, big: tuple[int, int] | None) -> dict:
                                borderValue=(114, 114, 114)), 8), 3)
 
     # label-side work, using a real dataset's label dict
-    from ultralytics.cfg import get_cfg
-    from ultralytics.data.build import build_yolo_dataset
+    # install() before binding build_yolo_dataset, for the same reason as in ooo_perf_run.py: the
+    # stock builder resolves the module-level ``YOLODataset`` name at call time, so an early import
+    # happens to work today, but relying on that is how the sibling tool ended up silently measuring
+    # the unpatched loader. Keep the order uniform.
     from ultralytics_ooo import install
 
     install()
+    import ultralytics.data.build as _build
+    from ultralytics.cfg import get_cfg
+
+    build_yolo_dataset = _build.build_yolo_dataset
     import yaml as _yaml
 
     data = _yaml.safe_load((Path(root) / "data.yaml").read_text(encoding="utf-8"))

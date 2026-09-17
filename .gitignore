@@ -226,3 +226,12 @@ __pycache__/
 
 丢弃未选中图片-可行性分析报告.md
 *可行性分析报告.md
+
+# Local verification artifacts
+_perf_review/
+_verify_out/
+_verify_probe/
+代码审查-章节重写版.md
+性能审查报告-全面重审版.md
+验证报告-内部自查版.md
+验证提示词.md

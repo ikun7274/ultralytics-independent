@@ -521,13 +521,28 @@ class OnlineSlice(BaseTransform):
         """
         h, w = img.shape[:2]
         tw, th = x1 - x0, y1 - y0
-        sub = np.ascontiguousarray(img[y0:y1, x0:x1])
+        # A VIEW, deliberately -- not ``np.ascontiguousarray(img[y0:y1, x0:x1])``.
+        #
+        # The tile is handed straight to ``_finalize_label``, whose ``cv2.resize`` reads a row-strided
+        # array correctly (verified bit-identical against resizing a contiguous copy: ``np.array_equal``
+        # True, max|diff| = 0, and equal to an independently constructed crop) and allocates its own
+        # output. So materialising a contiguous tile first was a full-resolution memcpy that the very
+        # next call threw away. Measured on a 2400x1800 tile of a 4000x3000 frame, medians of 7:
+        # crop-then-resize 10.79 ms vs resize-from-view 1.84 ms (5.9x). At 1280x720 the tile is small
+        # enough that the difference is 0.06 ms, so this is a large-frame optimisation.
+        #
+        # The dataset side keeps its guarantee that no writer ever sees an LRU-backed array: the guard
+        # in BaseDataset.get_image_and_label now catches views whose resize will NOT run (see there).
+        # Anything that WRITES the tile still gets a contiguous copy -- the save path below does
+        # its own ``ascontiguousarray``, so the copy only costs when saving is actually on.
+        sub = img[y0:y1, x0:x1]
         if len(idx) == 0:  # background tile: emitted only while background_count < positive_count * neg_ratio
             if self._allow_background():
                 if count:
                     self._bg_count += 1
                 if count and self.save_dir is not None and (self.save_max == 0 or self._saved < self.save_max):
-                    self._save_tile(sub, np.empty((0, 4), dtype=np.float32), np.empty(0), f"bg{os.getpid()}", src)
+                    self._save_tile(np.ascontiguousarray(sub), np.empty((0, 4), dtype=np.float32),
+                                    np.empty(0), f"bg{os.getpid()}", src)
                 return sub, self._empty_label(sub, label)
             # Background quota reached: keep the original image unchanged (mode A contract). In emit_all
             # mode (slice_at) this is exactly the Plan A fallback -- the ORIGINAL image is returned, never an
@@ -569,7 +584,7 @@ class OnlineSlice(BaseTransform):
             k[..., 1] = (k[..., 1] * h - y0) / th
             new_label["keypoints"] = k.astype(np.float32)
         if count and self.save_dir is not None and (self.save_max == 0 or self._saved < self.save_max):
-            self._save_tile(sub, local, cls, f"pos{os.getpid()}", src)
+            self._save_tile(np.ascontiguousarray(sub), local, cls, f"pos{os.getpid()}", src)
         return sub, new_label
 
     def __call__(self, img: np.ndarray, label: dict[str, Any], src: Any = None,
@@ -829,6 +844,10 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace):
     # degradation resample kernel ("area" = antialiased/slower, "linear" = faster/slightly softer);
     # mirrored here because _degrade_frame reads it per-call from `self`.
     dataset.degrade_resample = str(_hyp_get(hyp, "degrade_resample") or "linear")
+    # DataLoader prefetch depth, in batches per worker. Mirrored because the loader is built AFTER
+    # build_transforms and the builder only receives the dataset, never `hyp` -- without this copy the
+    # registered key would be accepted by the config and then silently ignored by every loader.
+    dataset.prefetch_factor = int(_hyp_get(hyp, "prefetch_factor") or 4)
 
     # ---- 在线切片 (slice_prob 独立开关) ----
     # slice_prob 是【总开关】而不是强度旋钮: 布尔值 True/False 是正式支持的写法, 与 1.0/0.0 等价

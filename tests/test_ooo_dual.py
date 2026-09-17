@@ -1,7 +1,8 @@
 """Regression: dual-metric sliced validation (pool/dual.py).
 
-The two behaviours pinned here are exactly the ones the original implementation got wrong, and that
-no other test covered -- the whole suite was green with both defects live.
+The behaviours pinned here are the ones the implementation got wrong, plus the two checkpoint-contract
+rules that came out of reading ``final_eval``. No other test covered any of them -- the whole suite was
+green with every defect live.
 
 1. ``_run_whole`` must hand ``v.dataloader`` back to the SLICED loader.
    The validator instance -- and hence its ``dataloader`` -- is reused for every epoch: the trainer
@@ -16,6 +17,15 @@ no other test covered -- the whole suite was green with both defects live.
    ``best_whole_fitness`` is only updated on a strict improvement, but the old guard compared it to
    ``fitness_whole`` with ``==``. An epoch that merely matched the best therefore overwrote
    ``best_whole.pt`` with its own ``last.pt``, destroying the real best snapshot.
+
+3. The whole family must have the same SHAPE as the main family: ``last_whole.pt`` mirrors ``last.pt``
+   every epoch, ``best_whole.pt`` mirrors ``best.pt`` on improvement, and neither exists unless dual
+   mode is actually on.
+
+4. ``final_eval`` must strip the whole-metric mirrors.
+   Upstream strips only ``last.pt`` / ``best.pt``. The mirrors are copied from an UNSTRIPPED ``last.pt``
+   before that point, so they used to survive as fp32 checkpoints still carrying the optimizer state --
+   several times larger than the ``best.pt`` they exist to be compared against.
 
 Run: python -m pytest tests/test_ooo_dual.py -q
 """
@@ -74,7 +84,7 @@ class _FakeValidator:
 
 
 class _FakeTrainer:
-    """Minimal BaseTrainer stand-in: the patch needs validate/save_model/wdir/last/batch_size."""
+    """Minimal BaseTrainer stand-in: the patch needs validate/save_model/final_eval/wdir/last/batch_size."""
 
     def __init__(self, validator, args, batch_size, wdir):
         self.validator = validator
@@ -83,6 +93,7 @@ class _FakeTrainer:
         self.wdir = wdir
         self.last = wdir / "last.pt"
         self.last.write_bytes(b"initial")
+        self.final_eval_calls = 0
 
     def validate(self):
         # Faithful to engine/trainer.py:871-877 -- the primary pass IS a call to self.validator(self)
@@ -96,11 +107,19 @@ class _FakeTrainer:
     def save_model(self):
         return None
 
+    def final_eval(self):
+        # Upstream strips last.pt / best.pt in here. The fake only counts the call: these tests are about
+        # the wrapper's own work on the whole-metric mirrors, not about upstream's strip.
+        self.final_eval_calls += 1
 
-def _build(tmp_path):
+    def read_results_csv(self):
+        return {"metrics/mAP50(B)": [0.5]}
+
+
+def _build(tmp_path, **arg_over):
     from ultralytics_ooo.pool.dual import patch_dual_metric
 
-    args = _args()
+    args = _args(**arg_over)
     v = _FakeValidator(args)
     trainer = _FakeTrainer(v, args, 8, tmp_path)
     patch_dual_metric(_FakeTrainer)
@@ -222,3 +241,115 @@ def test_patch_dual_metric_is_idempotent(tmp_path):
     patch_dual_metric(_FakeTrainer)
     assert _FakeTrainer.validate is first
     assert hasattr(_FakeTrainer, "_run_whole")
+
+
+# --- the whole-checkpoint family: last_whole.pt + the strip on the way out --------------------------------------
+
+
+def _write_real_ckpt(path, epoch=1):
+    """Write a checkpoint shaped the way ``trainer.save_model`` serializes one: ``model=None``, ``ema=<Module>``.
+
+    Deliberately real, so the REAL ``strip_optimizer`` can process it: it asserts ``"model" in x``, replaces
+    that entry with ``x["ema"]``, then calls ``.half()`` / ``.parameters()`` on the result. So the ``ema``
+    entry must be an ``nn.Module`` -- which is exactly what ``save_model`` stores (``unwrap_model(ema.ema)``
+    after a ``deepcopy(...).half()``, NOT the ModelEMA wrapper, which has none of those methods).
+    """
+    import torch
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "best_fitness": 0.5,
+            "model": None,
+            "ema": torch.nn.Linear(2, 2),
+            "optimizer": {"state": {}, "param_groups": [{"lr": 0.01}]},
+            "updates": epoch + 1,
+            "train_args": {"epochs": 2},
+            "train_results": {"metrics/mAP50(B)": [0.1]},
+        },
+        path,
+    )
+
+
+def _reload(path):
+    from ultralytics.utils.patches import torch_load
+
+    return torch_load(path, map_location="cpu")
+
+
+def test_last_whole_pt_mirrors_last_pt_every_epoch(tmp_path):
+    """last_whole.pt mirrors last.pt: always current, and NOT gated on the whole fitness improving."""
+    trainer, v = _build(tmp_path)
+    dst = tmp_path / "last_whole.pt"
+
+    for i in (1, 2, 3):
+        v.whole_fitness = 0.50  # first epoch IS an improvement (prev best is None), the rest tie
+        trainer.validate()
+        trainer.last.write_bytes(f"weights-epoch{i}".encode())
+        trainer.save_model()
+        assert dst.read_bytes() == f"weights-epoch{i}".encode(), f"epoch {i}: last_whole.pt not mirrored"
+
+
+def test_last_whole_pt_is_written_even_when_the_whole_pass_fails(tmp_path):
+    """A failed second pass still writes last_whole.pt -- see the reasoning in save_model.
+
+    "last" promises the LATEST state; gating it on the pass would instead leave a stale file from an
+    earlier epoch, which is worse for a file whose whole purpose is being current. The failure is already
+    warned about, and best_whole.pt is correctly left alone.
+    """
+    trainer, v = _build(tmp_path)
+    v.fail_whole = True
+    trainer.validate()
+    trainer.last.write_bytes(b"weights-after-failed-pass")
+    trainer.save_model()
+    assert (tmp_path / "last_whole.pt").read_bytes() == b"weights-after-failed-pass"
+    assert not (tmp_path / "best_whole.pt").exists()
+
+
+def test_no_whole_checkpoints_without_dual_mode(tmp_path):
+    """With dual off the weights dir must look exactly like a stock run's."""
+    trainer, _ = _build(tmp_path, val_slice_dual_metric=False)
+    trainer.validate()
+    trainer.last.write_bytes(b"weights")
+    trainer.save_model()
+    assert not (tmp_path / "last_whole.pt").exists()
+    assert not (tmp_path / "best_whole.pt").exists()
+
+
+def test_final_eval_strips_both_whole_mirrors(tmp_path):
+    """The defect: the mirrors were copied from an UNSTRIPPED last.pt and survived as fp32 + optimizer."""
+    trainer, v = _build(tmp_path)
+
+    v.whole_fitness = 0.80
+    trainer.validate()
+    _write_real_ckpt(trainer.last, epoch=1)
+    trainer.save_model()
+    for name in ("last_whole.pt", "best_whole.pt"):
+        assert (tmp_path / name).exists(), name
+
+    assert _reload(tmp_path / "best_whole.pt")["epoch"] == 1, "precondition: unstripped before final_eval"
+    assert _reload(tmp_path / "best_whole.pt")["optimizer"] is not None, "precondition: optimizer still present"
+
+    trainer.final_eval()
+    assert trainer.final_eval_calls == 1, "upstream's final_eval must still run exactly once"
+
+    import torch
+
+    for name in ("last_whole.pt", "best_whole.pt"):
+        ck = _reload(tmp_path / name)
+        assert ck["epoch"] == -1, f"{name}: epoch must be reset to -1"
+        assert ck["optimizer"] is None, f"{name}: the optimizer state must be dropped"
+        assert ck["ema"] is None, f"{name}: the heavy ema entry must be cleared"
+        assert ck["model"].weight.dtype == torch.float16, f"{name}: weights must be fp16"
+        assert not ck["model"].weight.requires_grad, f"{name}: requires_grad must be off"
+        assert ck["train_results"], f"{name}: the full train_results curve must be carried over"
+
+
+def test_final_eval_is_left_alone_without_dual_mode(tmp_path):
+    """No whole mirrors -> nothing to strip, and the wrapper must not touch the weights dir."""
+    trainer, _ = _build(tmp_path, val_slice_dual_metric=False)
+    trainer.validate()
+    _write_real_ckpt(trainer.last, epoch=1)
+    trainer.save_model()
+    trainer.final_eval()
+    assert trainer.final_eval_calls == 1
