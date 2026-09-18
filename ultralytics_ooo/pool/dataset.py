@@ -226,6 +226,32 @@ class OnlinePoolDataset(BaseDataset):
             self._mp_raw_hits = None
             self._mp_raw_misses = None
         self._raw_reported = (0, 0)
+        # ---- degraded-frame cache ("F5"): memoises what _cap_long_side PRODUCED (see _cap_frame_cached).
+        # Capacity is derived from the MOSAIC WINDOW, not the dataset -- the reuse being exploited
+        # comes from the mix pool, which upstream already bounds at _legacy_ims_cap, and two cap
+        # values coexist in one run (the degradation branches cap at 2*imgsz, compose at imgsz). The
+        # measured FIFO hit-rate curve is flat in dataset size over W=16..128, so tracking ``batch``
+        # is enough: 0 = auto, > 0 = that many frames, < 0 = disabled (read from hyp here, before the
+        # cache can be used; augment_setup deliberately does NOT mirror these -- overwriting the
+        # resolved capacity with the raw "0" would silently disable an auto-sized cache).
+        _cap_cache_frames = int(
+            getattr(hyp, "degrade_frame_cache_size", _online_default("degrade_frame_cache_size")) or 0
+        )
+        if _cap_cache_frames == 0:
+            _cap_cache_frames = 2 * _legacy_ims_cap(self.ni, self.batch_size)
+        self._cap_cache_size = max(0, _cap_cache_frames)
+        self._cap_cache_mb = float(
+            getattr(hyp, "degrade_frame_cache_mb", _online_default("degrade_frame_cache_mb")) or 0
+        )
+        self._cap_cache_budget = int(self._cap_cache_mb * (1 << 20)) if self._cap_cache_mb > 0 else 0
+        # key = (img_index, cap, kernel) -> (frame, scale). OrderedDict + popitem(last=False) is
+        # FIFO-by-first-fill: a hit must NOT move_to_end, or the resident set would depend on the
+        # access order and the decode/eviction pattern would stop matching upstream's (same reason the
+        # raw LRU is FIFO; see _load_image_cached_ex).
+        self._cap_cache: OrderedDict[tuple[int, float, int], tuple[np.ndarray, float]] = OrderedDict()
+        self._cap_cache_bytes = 0
+        self._cap_hits = 0
+        self._cap_misses = 0
         # ``cache`` cannot serve the mixed pool, and the gate is the LAYOUT, not slice_prob.
         #
         # Every pooled sample (origin, slicing tiles, and all five augmentation branches) is read at
@@ -1623,6 +1649,78 @@ class OnlinePoolDataset(BaseDataset):
         # LRU disabled: nothing was cached, so this read IS a decode and the caller must see that.
         return im, True
 
+    def _cap_frame_cached(self, img_index: int, im: np.ndarray, cap: float, interp: int,
+                          *, copy: bool = True) -> tuple[np.ndarray, float]:
+        """``_cap_long_side`` with a FIFO cache of the frames it produced (the "F5" fix).
+
+        WHY. The mixed pool reads each source image 11-12 times per epoch (mosaic mixes 4 images per
+        sample across 8 branch segments), and every one of those reads runs the SAME downscale on the
+        SAME pixels. Measured: 88% of the capped reads repeat a key that was already computed, and one
+        resample costs 0.87 ms at cap=640 / 5.46 ms at cap=1280. The cap allocates a NEW array when it
+        fires, so its result is a pure function of (source pixels, cap, kernel) and is safe to reuse.
+
+        THREE deliberate scopes, each of which is load-bearing:
+
+        * Only a FIRE is stored. When the long side is already within the cap -- or the cap is
+          disabled -- ``_cap_long_side`` hands back its INPUT, so there is no work to save and caching
+          it would pin a raw-LRU frame (a second copy of memory already held) for no gain.
+        * The source frame is ALWAYS read first, by the caller, through ``_load_image_cached_ex``.
+          The cache sits strictly AFTER the read, so the set of reads that count as decodes -- and
+          therefore the mosaic mix pool, which is fed by decode events
+          (``_touch_buffer_for_decode``) -- is unchanged. That is what keeps this optimisation
+          compatible with the package's "no switches -> byte-for-byte upstream" contract.
+        * Eviction is FIFO by first fill, NOT LRU (no ``move_to_end`` on a hit). Reordering the
+          resident set would change which frames stay resident, hence the decode pattern, hence the
+          mosaic window -- the exact failure mode the raw LRU's FIFO comment documents.
+
+        KEY is ``(img_index, cap, interp)``. ``cap`` is part of it because two cap values coexist in
+        a real run (degradation branches cap at ``2*imgsz``, compose at ``imgsz``); ``interp`` is part
+        of it because ``degrade_resample="area"`` selects INTER_AREA for the branches while compose
+        always asks for INTER_LINEAR -- a kernel-blind key would mix two different resamplings of the
+        same image.
+
+        OWNERSHIP (the reason ``copy`` defaults to True). The returned frame must be owned by the
+        caller, exactly like ``_degrade_frame_ex``'s ``capped is im`` guard guarantees for the raw
+        LRU: ``_finalize_label`` can hand its input straight on when ``r == 1``, and Mosaic / affine
+        write ``label["img"]`` in place. Handing out a cache entry there would corrupt it silently,
+        and unlike the raw LRU the damage would STICK -- one entry feeds dozens of later slots. So a
+        hit returns a fresh array (0.05-0.9 ms, against the 0.87-5.46 ms recompute it replaces).
+        ``copy=False`` is only for a caller that provably never writes the frame; compose memcpy's it
+        into a freshly allocated canvas, which is why it passes ``copy=False``.
+        """
+        size = self._cap_cache_size
+        if size <= 0:
+            return _cap_long_side(im, cap, interp=interp)
+        key = (int(img_index), float(cap), int(interp))
+        cache = self._cap_cache
+        hit = cache.get(key)
+        if hit is not None:
+            self._cap_hits += 1
+            frame = hit[0]
+            return (frame.copy() if copy else frame), hit[1]
+        capped, scale = _cap_long_side(im, cap, interp=interp)
+        if capped is im:
+            return capped, scale  # cap did not fire: nothing produced, nothing cached (see docstring)
+        self._cap_misses += 1
+        # ``>= 1`` semantics copied from the raw LRU: never evict the frame about to be stored, even
+        # if it alone exceeds the byte budget -- re-resampling it on every visit is strictly worse.
+        budget = self._cap_cache_budget
+        while cache and (len(cache) >= size or (budget and self._cap_cache_bytes + capped.nbytes > budget)):
+            _old_key, (old, _old_scale) = cache.popitem(last=False)
+            self._cap_cache_bytes -= old.nbytes
+        cache[key] = (capped, scale)
+        self._cap_cache_bytes += capped.nbytes
+        return (capped.copy() if copy else capped), scale
+
+    def cap_cache_stats(self) -> tuple[int, int, float, int]:
+        """``(hits, misses, resident_MiB, capacity)`` of the degraded-frame cache, process-local.
+
+        Deliberately NOT published to shared memory the way the raw LRU counters are: this cache is a
+        pure work reducer, so a per-worker tail is enough to diagnose it, and keeping it out of the
+        per-worker sync path avoids adding a second locked add to the hot loop.
+        """
+        return (self._cap_hits, self._cap_misses, self._cap_cache_bytes / (1 << 20), self._cap_cache_size)
+
     def _degrade_max_side(self) -> float:
         """Pixel cap applied to the degradation branches before they run.
 
@@ -1704,10 +1802,16 @@ class OnlinePoolDataset(BaseDataset):
         # noise writes into its own scratch, blur / haze / compose / the resize tail all return new
         # arrays. So the shared LRU buffer is never written through.
         im, decoded = self._load_image_cached_ex(img_index, copy=False)
-        capped, scale = _cap_long_side(im, self._degrade_max_side(), interp=interp)
+        # The resample is memoised (F5): a repeated read of the same image hits the cache instead of
+        # re-running the same downscale -- 88% of the capped reads are such repeats. The READ above
+        # stays unconditional, so decode events (and with them the mosaic window) are untouched, and
+        # the cache returns a frame owned by THIS caller, which keeps the guard below authoritative.
+        capped, scale = self._cap_frame_cached(img_index, im, self._degrade_max_side(), interp)
         if capped is im:
-            # The cap did NOT fire (long side <= cap, or the cap is disabled) and _cap_long_side handed
-            # back the LRU buffer ITSELF. Restore the copy here. Without it:
+            # The cap did NOT fire (long side <= cap, or the cap is disabled), so what came back is the
+            # LRU buffer ITSELF: _cap_frame_cached passes that case straight through and caches
+            # nothing, precisely so this guard stays the single owner of the returned array. Restore
+            # the copy here. Without it:
             #   (a) whenever _finalize_label also skips its resize (r == 1, i.e. the frame is already
             #       exactly imgsz), "img" keys the SAME array as a cache entry -- and Mosaic / affine
             #       write label["img"] IN PLACE, so the cache would be corrupted with no error anywhere;
@@ -2127,7 +2231,12 @@ class OnlinePoolDataset(BaseDataset):
             # This slot stands for FOUR sources, so it feeds the mosaic buffer when ANY of them really
             # decoded -- that is the same "a fresh frame became available" event the other branches use.
             any_decoded = any_decoded or src_decoded
-            im, _ = _cap_long_side(src, half, interp=cv2.INTER_LINEAR)
+            # copy=False: the composed canvas is freshly allocated and this frame is only memcpy'd
+            # into it (or handed to cv2.resize, which allocates), so the cached entry handed back here
+            # is never written through -- the same reasoning that lets the line above read the raw LRU
+            # with copy=False. compose caps at imgsz while the branches cap at 2*imgsz, which is why
+            # ``cap`` is part of the cache key rather than implied by the caller.
+            im, _ = self._cap_frame_cached(i, src, half, cv2.INTER_LINEAR, copy=False)
             imgs.append(im)
         # Unify sub-image size to the max in this group (stretching preserves normalized coords
         # linearly). W/H are the max over the ALREADY CAPPED group, so 2*W and 2*H are within

@@ -97,6 +97,34 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     "compose_max_side": 0,
     "degrade_max_side": 0,
     "degrade_resample": "linear",
+    # Capacity of the DEGRADED-FRAME cache, in frames -- the "F5" fix. It memoises what
+    # ``_cap_long_side`` PRODUCED, so the many reads one source image gets per epoch do not each
+    # repeat the same downscale: the mixed pool reads one image 11-12 times per epoch (mosaic mixes 4
+    # images per sample across 8 branch segments) and MEASURED 88% of the capped reads are repeats of
+    # a key that was already computed. Per hit it saves the resample itself: 0.87 ms at cap=640,
+    # 5.46 ms at cap=1280 (4K source).
+    #   0  -> auto: 2 * _legacy_ims_cap(ni, batch) = 2 * (min(ni, batch*8, 1000) - 1).
+    #         The factor 2 is because TWO cap values coexist in one run: the degradation branches cap
+    #         at 2*imgsz and compose caps its sources at imgsz. The capacity deliberately tracks
+    #         ``batch`` and NOT the dataset: the reuse comes from the mosaic mix pool, whose window
+    #         upstream already bounds at ``_legacy_ims_cap``, and the measured FIFO hit-rate curve is
+    #         flat in dataset size over W=16..128 (400 images vs 2000 images, work set 1.5 GB vs
+    #         7.6 GB, same curve; they only diverge at W>=256, i.e. when the whole work set fits).
+    #         W=auto already buys ~88% of the unbounded hit rate.
+    #   >0  -> that many frames.
+    #   <0  -> cache disabled. This is a pure A/B switch: the pipeline is byte-identical either way,
+    #         so it exists precisely so the equivalence can be re-measured.
+    # SCOPE: only a frame the cap actually PRODUCED is ever stored. When the long side is already
+    # within the cap (or the cap is disabled) ``_cap_long_side`` hands its input straight back, so
+    # there is no work to save -- and storing it would pin a raw-LRU frame in memory for nothing.
+    "degrade_frame_cache_size": 0,
+    # Byte budget for that cache, per worker (MiB; 0 = no byte limit, the frame count alone decides).
+    # A capped frame is bounded by the CAP, not by the source: at imgsz=640 the branches cap at 1280
+    # px, so a 16:9 frame is 2.76 MiB and the auto 126 frames are ~348 MiB/worker (@320 it is 84 MiB).
+    # The budget is what protects a large imgsz -- imgsz=1280 caps at 2560 px, i.e. 19.7 MiB/frame,
+    # where the frame count alone would be 2.5 GB/worker. It is enforced per insert and never evicts
+    # the frame it is about to store, so it can only shrink the frame count, never empty the cache.
+    "degrade_frame_cache_mb": 512,
     # --- sampling / caching budget ---
     "slice_grouped_sampler": True,
     # Per-worker raw-image LRU capacity, in FRAMES of the original-resolution image. Values in (0, 4)
