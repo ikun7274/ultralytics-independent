@@ -127,7 +127,7 @@ if __name__ == '__main__':
         occlusion_blocks=1,           # 每图遮挡块数 (1~3)
         occlusion_size_ratio=0.2,     # 单块面积上限(相对原图面积), 防目标被完全盖住
         occlusion_color="auto",       # auto=采样图像深色分位均值(融入场景); 或 black/gray 固定色
-        occlusion_max_cover=0.95,     # 目标被遮挡面积占比 >= 该值则从标签剔除 (完全被盖住的目标=纯噪声); 1.0=标签永不变
+        occlusion_max_cover=0.5,     # 目标被遮挡面积占比 >= 该值则从标签剔除 (完全被盖住的目标=纯噪声); 1.0=标签永不变
 
 
         # ---------训练后期关闭在线增强 (close_aug_epoch): 与 close_mosaic 同构的时间维衰减---------

@@ -18,6 +18,25 @@ class SegmentBases(NamedTuple):
     """Mixed-pool segment boundaries: named fields instead of a bare 8-tuple.
 
     Field order equals the legacy tuple order, so position-unpacking call sites remain valid.
+
+    FIELD SEMANTICS -- mind the asymmetry, it is easy to misread:
+        ``base``      is the BASE SEGMENT LENGTH (a slot count), not an offset. The base segment is the
+                      one that starts at index 0, so it never needs a start offset of its own.
+        ``origin`` .. ``occlusion`` are the START INDEX of each following segment.
+        ``total``     is ``sum(all segment lengths)`` == ``len(dataset)``.
+
+    So ``seg.base`` answers "how many base slots are there" while ``seg.origin`` answers "where does
+    the origin segment begin". The order is kept (base first, as the legacy tuple had it) because
+    position-unpacking call sites depend on it; read the field names, not the positions.
+
+    CONSEQUENCE, and the reason this paragraph exists: the base segment starts at index 0, so the
+    origin segment necessarily starts at ``lens[0]`` -- which is also the value of ``base``. Hence
+    ``seg.base == seg.origin`` for EVERY configuration, always. Two fields with the same number but
+    different meanings; do not "simplify" either away, and do not write an invariant that expects them
+    to differ. With ``lens`` the seven segment lengths, the full contract is
+    ``(base, origin, ratio, blur, compose, weather, occlusion, total)
+      == (lens[0], *cumsum(lens)[:6], sum(lens))``
+    e.g. all-branches lengths (4, 0, 4, 8, 1, 4, 4) -> (4, 4, 4, 8, 16, 17, 21, 25).
     """
 
     base: int
@@ -137,6 +156,11 @@ def patch_build_dataloader() -> None:
             # constant and args.seed no longer changed augmentation randomness at all.
             seed = torch.initial_seed() - int(_b.RANK) - 1
             grouped = GroupedImageSampler.from_dataset(dataset, seed=seed)
+        # Publish the OUTCOME so the dataset's per-epoch raw-LRU report can state which order was
+        # really used. That report used to read the config flag instead, so a pool where grouping
+        # declined (compose-only layouts among them) logged "grouped sampler" while RandomSampler was
+        # actually shuffling. Set on both branches, so "declined" is visible rather than absent.
+        dataset._ooo_grouped_engaged = grouped is not None
         # Prefetch depth, in batches per worker. Resolved for BOTH branches so a mis-set value is
         # reported rather than silently ignored (see _warn_prefetch_ignored).
         prefetch = int(getattr(dataset, "prefetch_factor", _online_default("prefetch_factor")) or 4)

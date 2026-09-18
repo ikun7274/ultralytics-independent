@@ -116,6 +116,18 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     # per sample, cap 16 32.07 ms / 1.38, cap 32 31.08 ms / 0.93 -- the curve saturates at 16-32.
     # The old default of 4 was set from a 24-image pool where the whole dataset fits in the Mosaic window
     # and capacity cannot matter, so it did not extrapolate to real dataset sizes.
+    #
+    # EFFECTIVE CAPACITY (important): the dataset caps whatever you set here at upstream's own
+    # whole-image cache bound, ``min(ni, batch*8, 1000) - 1`` (constants._legacy_ims_cap). That is NOT a
+    # throughput loss -- the bound is >= 17 for any dataset with more than 17 images or a batch of 3+,
+    # i.e. it sits ABOVE this default (a 8520-image set at batch 16 gets 127) and only shrinks on the
+    # tiny sets where every frame is resident anyway. The cap exists because the mosaic mix pool is fed
+    # BY decode events (_touch_buffer_for_decode reproduces upstream's "append on decode" rule), so a
+    # cache larger than upstream's suppresses those events and freezes the mosaic window. Measured with
+    # every project switch at its default (8 images, batch 4, mosaic=1.0): epoch 0 was byte-identical to
+    # pristine upstream but epoch 1 differed on 7/8 samples with max pixel delta 255. With the cap --
+    # and with the cache evicting FIFO-by-first-decode instead of LRU, so its resident set matches
+    # upstream's self.ims -- both epochs are byte-identical again.
     "slice_raw_cache_size": 16,
     # Byte budget for the same LRU, per worker (MiB; 0 = no byte limit, frames alone decide). The cache
     # stores ORIGINAL-resolution frames, whose size is not known before the first decode, so the frame

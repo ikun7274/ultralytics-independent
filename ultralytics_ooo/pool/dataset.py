@@ -38,6 +38,7 @@ from ultralytics_ooo.core import (
 from ultralytics_ooo.core.saver import _ensure_dir, _imwrite
 from ultralytics_ooo.pool.constants import (
     _describe_ims_cap,
+    _legacy_ims_cap,
     _online_default,
     _resolve_ims_cap,
     get_split_fraction,
@@ -111,7 +112,38 @@ class OnlinePoolDataset(BaseDataset):
             LOGGER.info(f"{self.prefix}{_describe_ims_cap(hyp, self._ims_cap, self.imgsz, self.channels)}")
         self._raw_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", _online_default("slice_raw_cache_size")) or 0)
-        self._raw_cache_size = max(4, _raw_cache_size) if _raw_cache_size > 0 else 0
+        if _raw_cache_size > 0:
+            # Align the read cache with upstream's OWN whole-image cache bound.
+            #
+            # Why this cap exists: the mosaic mix pool is fed BY decode events
+            # (_touch_buffer_for_decode appends only when the read really decoded, reproducing
+            # upstream's rule). That rule's INPUT -- whether a visit is a decode at all -- depends on
+            # the cache capacity. Upstream's capacity is ``_legacy_ims_cap`` =
+            # min(ni, batch*8, 1000) - 1; a LARGER pool cache suppresses decodes, so the mosaic window
+            # stops turning over. Measured consequence with every project switch left at its default
+            # (8 images, batch 4, mosaic=1.0): epoch 0 was byte-identical to pristine upstream, but
+            # epoch 1 had 7 of 8 samples differing with max pixel delta 255, because the pool decoded
+            # 0 times against upstream's 8 and ``random.choices(buffer)`` then picked different
+            # mosaic partners. That silently broke the "no switches -> upstream" contract the package
+            # advertises, and with it every same-seed A/B against an upstream baseline.
+            #
+            # The cap costs nothing in practice: ``_legacy_ims_cap`` is >= 17 whenever the dataset has
+            # more than 17 images or the batch is 3+, so it is ABOVE the shipped 16 for every real
+            # dataset (a 8520-image set at batch 16 gets 127) and only binds on the tiny sets where
+            # every frame is resident anyway. The ``slice_raw_cache_mb`` byte budget still caps the
+            # resident memory independently, which is what actually protects large frames.
+            _requested = max(4, _raw_cache_size)
+            _aligned = _legacy_ims_cap(self.ni, self.batch_size)
+            self._raw_cache_size = min(_requested, _aligned)
+            if self._raw_cache_size != _requested:
+                LOGGER.info(
+                    f"{self.prefix}raw-image LRU capped to {self._raw_cache_size} frames "
+                    f"(requested slice_raw_cache_size={_requested}) to match upstream's whole-image "
+                    f"cache bound min(ni, batch*8, 1000)-1 = {_aligned}; a larger read cache would "
+                    f"freeze the mosaic mix pool and break upstream equivalence."
+                )
+        else:
+            self._raw_cache_size = 0
         # Byte budget for the same LRU (0 = unlimited). The cache holds ORIGINAL-resolution frames, so
         # the frame count above cannot be turned into memory before the first decode; the budget is
         # therefore enforced per insert in ``_load_image_cached``. It only ever BINDS the frame count
@@ -1273,6 +1305,30 @@ class OnlinePoolDataset(BaseDataset):
             for j, img in enumerate(self._sel_indices("occlusion", n)):
                 per_image[img].append(segment_bases.occlusion + j)
 
+        # compose is gated HERE too (see the ``on`` table above): with compose OFF its segment is zero
+        # slots wide, so an ungated lookup would hand out ``range(ceil(N/4))`` indices that land on / past
+        # the segments that follow and fail the count check below.
+        compose_slot = (
+            {g: segment_bases.compose + j for j, g in enumerate(self._sel_indices("compose", (n + 3) // 4))}
+            if on["compose"]
+            else {}
+        )
+        # Fold compose into the per-image fan-out BEFORE the test below -- and PREPEND it, so its unit
+        # still emits the compose sample first and primes the LRU for the whole unit.
+        #
+        # It has to happen before the test. compose is often the ONLY thing that gives a source image
+        # more than one slot, and the test below is the sole disqualifier for grouping. With the fold
+        # after it, a compose-only pool measured ``fan_out == 1`` and grouped_sample_units returned None
+        # even though its units were a valid permutation (verified by replaying the layout by hand:
+        # ``[[[8, 0], [1], [2], [3]], [[9, 4], [5], [6], [7]]]`` over ``range(10)``). Grouping was
+        # therefore switched off exactly where it pays most -- compose re-reads FOUR source images at
+        # once -- and the docstring's claim that the fan-out is "computed from the fan-out actually
+        # drawn below" was not true for the one branch that draws extra slots after the test.
+        for _g, _slot in compose_slot.items():
+            _start = _g * 4
+            if _start < n:
+                per_image[_start].insert(0, _slot)
+
         # --- the ONLY disqualifying condition: nothing to reuse ------------------------------------
         # An image with a single slot has no repeated decode to absorb, and grouping it would only
         # narrow Mosaic's recent-sample window for no gain.
@@ -1286,36 +1342,19 @@ class OnlinePoolDataset(BaseDataset):
         # images, same test harness, real DataLoader): cache 16 grouped 41.0 items/s vs cache 16 shuffled
         # 34.4; cache 32 grouped 44.3 vs 37.7 -- grouping wins at the very cache size the old guard
         # switched it off at. Units hold <= 4 images and are walked round-robin, so every re-read of a
-        # unit's image hits as soon as the LRU holds those <= 4 images, which the documented floor
+        # unit's image hits as soon as the cache holds those <= 4 images, which the documented floor
         # (``slice_raw_cache_size >= 4``) guarantees. There is therefore no cache size at which turning
         # grouping off is the better choice, so the guard is deleted rather than inverted.
         fan_out = max((len(b) for b in per_image), default=0)
         if fan_out < 2:
             return None
 
-        units: list[list[list[int]]] = []
         # Units are ALWAYS consecutive blocks of four images, so every image owns exactly one block
-        # (no index can be emitted twice -- the check below enforces that).
-        compose_base = segment_bases.compose
-        # compose is gated HERE too (see the ``on`` table above): with compose OFF its segment is zero
-        # slots wide, so an ungated lookup would hand out ``range(ceil(N/4))`` indices that land on / past
-        # the segments that follow and fail the count check below.
-        compose_slot = (
-            {g: compose_base + j for j, g in enumerate(self._sel_indices("compose", (n + 3) // 4))}
-            if on["compose"]
-            else {}
-        )
-        for start in range(0, n, 4):
-            blocks = [per_image[i] for i in range(start, min(start + 4, n))]
-            slot = compose_slot.get(start // 4)
-            if slot is not None:
-                # The compose sample reads its whole group at once, so it is emitted FIRST inside the
-                # unit that owns image ``start``: for a complete group its four decodes are exactly this
-                # unit's images and prime the LRU for every block here. The tail group wraps around to
-                # earlier images, which is harmless: it costs those decodes once per epoch and the unit
-                # it belongs to only holds the images that are left.
-                blocks[0] = [slot, *blocks[0]]
-            units.append(blocks)
+        # (no index can be emitted twice -- the check below enforces that). The compose slot is already
+        # inside ``per_image`` at the head of its group's first image (see the fold above).
+        units: list[list[list[int]]] = [
+            [per_image[i] for i in range(start, min(start + 4, n))] for start in range(0, n, 4)
+        ]
 
         flat = sorted(index for unit in units for block in unit for index in block)
         if flat != list(range(segment_bases.total)):
@@ -1390,7 +1429,17 @@ class OnlinePoolDataset(BaseDataset):
             return
         hits = stats[0] - self._raw_reported[0]
         self._raw_reported = stats
-        order = "grouped" if self.slice_grouped_sampler else "globally shuffled"
+        # Report what the loader ACTUALLY did, not what the config asked for. This used to key off
+        # ``slice_grouped_sampler`` alone, so a pool where grouping declined (see
+        # ``grouped_sample_units``) still logged "grouped sampler" while the stock RandomSampler was
+        # shuffling -- which pointed every future low-hit-rate investigation at the wrong cause.
+        # ``patch_build_dataloader`` publishes the real outcome; the config value is only used as a
+        # fallback when that patch did not run (direct dataset use, tests).
+        engaged = getattr(self, "_ooo_grouped_engaged", None)
+        if engaged is None:
+            order = ("grouped" if self.slice_grouped_sampler else "globally shuffled") + " (configured)"
+        else:
+            order = "grouped" if engaged else "globally shuffled"
         budget = f", budget {self._raw_cache_mb:.0f} MiB" if self._raw_cache_mb > 0 else ""
         LOGGER.info(
             f"{self.prefix}raw-image LRU (slice_raw_cache_size={self._raw_cache_size}{budget}, "
@@ -1523,9 +1572,20 @@ class OnlinePoolDataset(BaseDataset):
         if size > 0:
             hit = cache.get(img_index)
             if hit is not None:
-                # Refresh the order on hit, so hot entries are not evicted purely by first-load time
-                # (a plain dict hit used to leave the entry in its original slot).
-                cache.move_to_end(img_index)
+                # NO ``move_to_end`` on a hit: this cache is deliberately FIFO by first-decode, not
+                # LRU, so that its resident set coincides with upstream's ``self.ims``.
+                #
+                # Upstream never reorders on a hit (``load_image`` returns straight out of
+                # ``self.ims``), and it only clears an entry when the MOSAIC BUFFER evicts it, i.e. the
+                # resident set is "the last N images that really decoded". Reordering here made the
+                # pool's resident set "the N most recently USED images", which differs on the cyclic
+                # access pattern Mosaic generates -- the pool then hit more often, appended to the
+                # mosaic buffer less often, and ``Mosaic.get_indexes`` picked different partners.
+                # Measured with capacity already aligned to 7: with the LRU refresh epoch 1 had 7/8
+                # samples differing from upstream (max pixel delta 255); FIFO is what makes the two
+                # resident sets agree. The refresh was originally added so a hot entry could not be
+                # evicted by first-load time, but that benefit is exactly what breaks the package's
+                # headline "no switches -> byte-for-byte upstream" contract, so it is dropped.
                 self._raw_hits += 1
                 return (hit.copy() if copy else hit), False
 
@@ -1627,15 +1687,34 @@ class OnlinePoolDataset(BaseDataset):
         branch reaches ``_begin_branch_label`` the read is long over, and re-deriving "was it a hit"
         would need a second cache query whose answer the LRU has already changed (the frame was inserted
         by this very call).
+
+        OWNERSHIP: the returned frame is always owned by the caller (never an LRU buffer). That is what
+        makes ``copy=False`` safe below, and the ``capped is im`` guard is the single line that enforces
+        it -- see the comment on it.
         """
-        # The cap itself lives in _cap_long_side so compose can apply the same rule.
         # The cap itself lives in _cap_long_side so compose can apply the same rule. The kernel is
         # configurable (degrade_resample: "area" = antialiased/slower, "linear" = faster/softer);
         # geometry is identical either way, only the resampling filter differs.
         resample = str(getattr(self, "degrade_resample", _online_default("degrade_resample")) or "linear")
         interp = cv2.INTER_LINEAR if resample == "linear" else cv2.INTER_AREA
-        im, decoded = self._load_image_cached_ex(img_index)
+        # copy=False: _cap_long_side allocates a NEW frame whenever the cap actually fires, so the
+        # hand-off copy this call used to take was dropped unread on every capped read -- 18.2 ms per
+        # 4000x3000 frame, 6 of them per image, i.e. the single largest data-side cost in the whole
+        # pool. Every consumer below only READS the frame: occlusion and rain copy before drawing,
+        # noise writes into its own scratch, blur / haze / compose / the resize tail all return new
+        # arrays. So the shared LRU buffer is never written through.
+        im, decoded = self._load_image_cached_ex(img_index, copy=False)
         capped, scale = _cap_long_side(im, self._degrade_max_side(), interp=interp)
+        if capped is im:
+            # The cap did NOT fire (long side <= cap, or the cap is disabled) and _cap_long_side handed
+            # back the LRU buffer ITSELF. Restore the copy here. Without it:
+            #   (a) whenever _finalize_label also skips its resize (r == 1, i.e. the frame is already
+            #       exactly imgsz), "img" keys the SAME array as a cache entry -- and Mosaic / affine
+            #       write label["img"] IN PLACE, so the cache would be corrupted with no error anywhere;
+            #   (b) the branch would be handed live writable access to the shared cache entry.
+            # On the capped path this costs nothing (the resize result replaces it anyway), which is
+            # why the guard -- not the copy -- is what makes the optimisation safe. Do not delete it.
+            capped = im.copy()
         return capped, scale, decoded
 
     def _build_blur_sample(self, index: int, img_index: int, long: bool = False) -> dict[str, Any]:
@@ -1907,9 +1986,16 @@ class OnlinePoolDataset(BaseDataset):
             new_w, new_h, pad_left, pad_top = w, h, 0, 0
         else:
             new_w, new_h, pad_left, pad_top = pad
-            C = im.shape[2]
-            big = np.full((new_h, new_w, C), _RATIO_PAD_COLORS[color_key], dtype=im.dtype)
-            big[pad_top:pad_top + h, pad_left:pad_left + w] = im
+            # cv2.copyMakeBorder in ONE call instead of "allocate a filled canvas + block-copy the frame
+            # into it": identical bytes (np.array_equal True), 3.05x faster (14.29 -> 4.68 ms at
+            # 1280x960 -> 1707x960) and it peaks one canvas lower, which is what matters per worker.
+            # The four widths are (top, bottom, left, right) and bottom/right are the REMAINDERS, not
+            # pad_top/pad_left: pad_top is the CENTRED offset, so an odd difference makes the two sides
+            # differ by one pixel. Passing the offset for the far side shifts the frame silently.
+            big = cv2.copyMakeBorder(
+                im, pad_top, new_h - h - pad_top, pad_left, new_w - w - pad_left,
+                cv2.BORDER_CONSTANT, value=_RATIO_PAD_COLORS[color_key],
+            )
             del im
 
         lb = self.labels[img_index]

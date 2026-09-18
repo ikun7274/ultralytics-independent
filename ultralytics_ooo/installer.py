@@ -24,6 +24,9 @@ from __future__ import annotations
 
 _INSTALLED = False
 
+# Cached "upstream-only" key set. See install() for why it must be cached AND filtered.
+_PRISTINE_KEYS: set[str] | None = None
+
 
 def install() -> None:
     """Install the mixed-pool dataset factory and the set_epoch callback onto stock Ultralytics."""
@@ -41,15 +44,28 @@ def install() -> None:
     from ultralytics_ooo.dataset_class import InstalledYOLODataset
     from ultralytics_ooo.pool.constants import _ONLINE_DEFAULTS, check_online_defaults_are_project_only
 
-    # Snapshot the PRISTINE upstream key set before the loop below adds our own keys to it: comparing
-    # against the live dict afterwards would "discover" every project key as an upstream duplicate.
-    _pristine_keys = set(DEFAULT_CFG_DICT)
-    _drift = check_online_defaults_are_project_only(_pristine_keys)
+    # Snapshot the upstream-only key set for the drift check below.
+    #
+    # ``set(DEFAULT_CFG_DICT)`` alone is NOT that set: the loop underneath writes our own keys into
+    # the very same dict, so on any SECOND install (a re-imported copy of the package, or two copies
+    # imported through different paths -- exactly the case the marker-based idempotency further down
+    # is written to support) the snapshot can no longer tell our keys from upstream's. Measured: the
+    # guard then reported all 80 project keys as upstream collisions and advised deleting the whole
+    # fallback table, which would have left ``_online_default()`` returning None for every one of
+    # them. Two changes make it order-independent: subtract the package's own keys, and cache the
+    # result so the check always runs against one stable set.
+    global _PRISTINE_KEYS
+    if _PRISTINE_KEYS is None:
+        _PRISTINE_KEYS = set(DEFAULT_CFG_DICT) - set(_ONLINE_DEFAULTS)
+    _drift = check_online_defaults_are_project_only(_PRISTINE_KEYS)
     if _drift:
         LOGGER.warning(
             f"ultralytics_ooo: {len(_drift)} config key(s) in pool/constants.py::_ONLINE_DEFAULTS are "
-            f"also defined by upstream default.yaml ({_drift}). The package fallbacks for them are "
-            f"stale -- delete them from the table so upstream stays the single source of truth."
+            f"now ALSO defined by upstream default.yaml ({_drift}). Upstream has taken ownership of "
+            f"them, so this package's fallback value is never applied (install() only writes a key "
+            f"when it is absent) while still being live behind ~120 `getattr(self, key, "
+            f"_online_default(key))` sites. Remove those rows from pool/constants.py::_ONLINE_DEFAULTS "
+            f"so upstream stays the single source of truth -- do NOT remove the rest of the table."
         )
 
     for _k, _v in _ONLINE_DEFAULTS.items():

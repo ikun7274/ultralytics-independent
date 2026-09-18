@@ -127,6 +127,22 @@ def _crop_kernel(kernel: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
     return cropped, (c - x0, c - y0)
 
 
+def _match_ndim(src: np.ndarray, out: np.ndarray) -> np.ndarray:
+    """Re-attach the trailing channel axis OpenCV drops for single-channel input.
+
+    ``cv2.blur`` / ``cv2.filter2D`` / ``cv2.convertScaleAbs`` all return a 2-D array when handed an
+    ``(H, W, 1)`` array, so these kernels used to change the shape contract for grayscale frames
+    (measured: motion blur, weather/rain and weather/haze turned ``(60, 80, 1)`` into ``(60, 80)``).
+    The dataset path happens to recover -- ``_finalize_label`` does ``img[..., None]`` when ``ndim == 2``
+    -- and the branch images are all produced by ``_load_image_cached_ex``, which guarantees at least
+    3 dims. But a kernel that silently drops an axis is a trap for every other caller, so the contract
+    "shape in == shape out" is restored here rather than left to the consumer.
+    """
+    if src.ndim == 3 and out.ndim == 2:
+        return out[..., None]
+    return out
+
+
 def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.0,
                        defocus_sigma: float = 0.0, axis_aligned: bool = False) -> np.ndarray:
     """Apply motion blur (and optional defocus) to a BGR/grayscale image.
@@ -144,7 +160,7 @@ def _apply_motion_blur(img: np.ndarray, length: float = 15.0, angle: float = 30.
     if defocus_sigma > 0:
         ksize = int(6 * defocus_sigma) | 1  # odd kernel size
         blurred = cv2.GaussianBlur(blurred, (ksize, ksize), defocus_sigma)
-    return blurred
+    return _match_ndim(img, blurred)
 
 
 # --- Weather degradation -----------------------------------------------------
@@ -175,10 +191,17 @@ def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.1
                 cv2.polylines(overlay, [p for p in batch], isClosed=False, color=(205, 205, 225),
                               thickness=t, lineType=cv2.LINE_AA)
         alpha = np.random.uniform(0.2, 0.6)
-        return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
+        if overlay.ndim == 3 and overlay.shape[2] == 3:
+            # Blend straight back into the overlay buffer: same pixels, one full-frame allocation less
+            # (measured 5.77 -> 4.68 ms at 1280x960, np.array_equal True). Restricted to 3-channel
+            # frames because OpenCV maps an (H, W, 1) input to a 1-CHANNEL Mat: there the blend comes
+            # back 2-D and _match_ndim has to re-attach the axis, so handing it a dst= buffer is unsafe.
+            cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0.0, dst=overlay)
+            return overlay
+        return _match_ndim(img, cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0))
     if weather_type == "haze":
         t = max(0.0, min(1.0, 1.0 - haze_beta))
-        return cv2.convertScaleAbs(img, alpha=t, beta=200.0 * (1.0 - t))
+        return _match_ndim(img, cv2.convertScaleAbs(img, alpha=t, beta=200.0 * (1.0 - t)))
     # noise: cv2.randn into ONE scratch buffer; handed a single-channel view so sigma is not scaled
     # by 1/sqrt(3); one integer pulled from the numpy stream seeds OpenCV's RNG to keep lockstep.
     #
@@ -204,13 +227,22 @@ def _apply_weather(img: np.ndarray, weather_type: str, rain_density: float = 0.1
     scratch = np.empty(img.shape, dtype=np.int16)
     if sigma > 0:
         cv2.randn(scratch.reshape(scratch.shape[0], -1), 0.0, sigma)
-        # cv2.add saturates into dst, so no explicit clip is needed for the add itself; the clip
-        # below still matters because int16 addition of a >255 noise excursion can undershoot 0.
-        cv2.add(img.astype(np.int16), scratch, dst=scratch, dtype=cv2.CV_16S)
+        # ``dtype=cv2.CV_16S`` already converts the uint8 source to the int16 destination, so the
+        # explicit ``img.astype(np.int16)`` only materialised a second full int16 frame (3.7 MB at
+        # 1280x960) for the add to read back. Dropping it is bit-identical: measured 11.22 -> 7.52 ms
+        # on this project's hardware, max|diff| = 0 (_perf_review/ooo6/verify6.py, part A).
+        cv2.add(img, scratch, dst=scratch, dtype=cv2.CV_16S)
     else:
         scratch[...] = img
-    np.clip(scratch, 0, 255, out=scratch)
-    return scratch.astype(np.uint8)
+    # Saturation into CV_8U is exactly ``clip(0, 255)`` followed by ``astype(uint8)``, but as ONE pass
+    # instead of two full-frame numpy traversals (measured 12.60 -> 3.64 ms, max|diff| = 0). This
+    # relies on cv2.add saturating to the DST type: with an int16 input a negative excursion must
+    # clamp to 0. Do NOT "simplify" this to cv2.convertScaleAbs -- that takes the ABSOLUTE value of
+    # the negative excursions instead of clamping them, which is a silent pixel-level change.
+    # ``_match_ndim`` is mandatory, not cosmetic: an (H, W, 1) frame reaches here too (ndim == 3, so it
+    # takes the int16 branch above), OpenCV maps it to a 1-CHANNEL Mat and hands back (H, W) --
+    # dropping the axis the old ``scratch.astype`` preserved. Same trap the other kernels document.
+    return _match_ndim(img, cv2.add(scratch, 0, dtype=cv2.CV_8U))
 
 
 # --- Occlusion ---------------------------------------------------------------
@@ -282,7 +314,11 @@ def _apply_occlusion(
                 boxes.append((x0, y0, x1, y1))
         else:  # rect
             side = base * random.uniform(0.5, 1.0)
-            bw, bh = int(side * random.uniform(0.7, 1.3)), int(side * random.uniform(0.7, 1.3))
+            # max(1, ...) so a tiny image cannot produce a zero-area occluder: with base = max(2, ...)
+            # at the floor, ``int(side * 0.7)`` is 0 for a 4x4 frame, which drew nothing yet was still
+            # appended to ``boxes`` and then contributed 0 to every coverage ratio.
+            bw = max(1, int(side * random.uniform(0.7, 1.3)))
+            bh = max(1, int(side * random.uniform(0.7, 1.3)))
             x0 = random.uniform(0.0, max(1.0, float(w - bw)))
             y0 = random.uniform(0.0, max(1.0, float(h - bh)))
             x0i, y0i = int(x0), int(y0)

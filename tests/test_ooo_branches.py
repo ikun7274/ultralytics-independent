@@ -950,3 +950,174 @@ def test_slice_branch_never_hands_the_lru_buffer_downstream(tmp_path, monkeypatc
     cached_ids = {id(v) for v in ds._raw_cache.values()}
     aliased = sum(1 for arr in handed if id(arr) in cached_ids)
     assert aliased == 0, f"{aliased}/{len(handed)} samples were handed the LRU's own buffer"
+
+
+def test_degradation_branches_never_hand_the_lru_buffer_downstream(tmp_path, monkeypatch):
+    """Contract guard for the ``copy=False`` fast path in ``_degrade_frame_ex``.
+
+    ``_degrade_frame_ex`` used to take a full-resolution hand-off copy on EVERY read -- the most
+    expensive single item in the data pipeline (18.2 ms for a 4000x3000 frame, six of them per image)
+    -- and dropped it unread whenever the working-resolution cap fired, because ``_cap_long_side``
+    allocates its own result. It now reads with ``copy=False`` and restores the copy only on the
+    ``capped is im`` path.
+
+    The optimisation is sound only while every branch merely READS the frame it is handed, and that
+    premise has no type-level enforcement -- the single ``capped is im`` guard is all there is. So this
+    pins the guard's own contract: the frame ``_degrade_frame_ex`` RETURNS is always owned by the
+    caller, never an LRU entry. On this fixture the auto cap (2 * imgsz = 128) cannot fire for a 64x48
+    source, so every degradation read takes the guarded path, which is the one the guard exists for.
+
+    Reading the same contract one step FURTHER DOWN does not work, and that is worth recording: the
+    first version of this test asserted on what reached ``_finalize_label`` and could never bite,
+    because blur / weather / occlusion each allocate their own result -- the cache's identity is
+    already gone by the time any of them returns. It passed before and after the mutation. The
+    kernel-side half of the contract (an op must not WRITE THROUGH to the frame it is handed) is
+    tests/test_ooo_core.py::test_degradation_ops_never_write_through_to_their_input; both halves are
+    proven non-vacuous by _perf_review/inject_check.py.
+    """
+    ds = _build(tmp_path / "deg_lru_alias", **{**ALL_ON, "slice_prob": 0.0})
+    ds.set_epoch(0, 10)
+    assert ds._degrade_max_side() == 2 * 64, ds._degrade_max_side()
+    # non-vacuity: the layout has to actually contain degradation slots
+    lens = ds._segment_lengths()
+    assert sum(lens[2:]) > 0, f"no degradation slots in the layout: {lens}"
+
+    # Every array the cache hands out WITHOUT a copy, held BY REFERENCE. Checking against
+    # ``{id(v) for v in ds._raw_cache.values()}`` instead would be defeated by the LRU itself: on this
+    # fixture capacity is clamped to min(ni, batch*8, 1000) - 1 frames, so a leaked frame has usually
+    # been evicted by the time the assertion runs and its id is no longer in the dict. Holding the
+    # object keeps its id stable, and it is what makes the inject_check case bite.
+    shared = []
+    orig_load = ds._load_image_cached_ex
+
+    def _load(img_index, *, copy=True):
+        im, decoded = orig_load(img_index, copy=copy)
+        if not copy:
+            shared.append(im)
+        return im, decoded
+
+    monkeypatch.setattr(ds, "_load_image_cached_ex", _load)
+
+    handed = []
+    orig_frame = ds._degrade_frame_ex
+
+    def _spy(*a, **kw):
+        out = orig_frame(*a, **kw)
+        handed.append(out[0])
+        return out
+
+    monkeypatch.setattr(ds, "_degrade_frame_ex", _spy)
+
+    for i in range(len(ds)):
+        ds.get_image_and_label(i)
+
+    assert handed, "the degradation frame path never ran -- this test would be vacuous"
+    assert shared, "no copy=False read happened -- this test would be vacuous"
+    shared_ids = {id(a) for a in shared}
+    leaked = [i for i, a in enumerate(handed) if id(a) in shared_ids]
+    assert not leaked, (
+        f"{len(leaked)}/{len(handed)} degradation frames came back as the LRU's own buffer "
+        f"(slots {leaked[:8]}) -- the ``capped is im`` guard in _degrade_frame_ex is gone"
+    )
+
+
+def test_ratio_pad_call_site_puts_the_remainder_on_the_far_side(tmp_path, monkeypatch):
+    """``_build_ratio_sample`` must pass the REMAINDERS as ``copyMakeBorder``'s bottom/right.
+
+    tests/test_ooo_core.py pins the FORMULA (copyMakeBorder == "filled canvas + block copy"), but it
+    rebuilds both sides locally from ``_ratio_pad_params`` and never enters the real call site -- so
+    handing ``pad_top`` / ``pad_left`` to the far side slipped past it untouched (found with
+    _perf_review/inject_check.py). What only the call site can get wrong is the CANVAS SHAPE: on the
+    padded axis, ``_ratio_pad_params`` returns a CENTRED offset, so when the difference is odd the two
+    sides differ by one pixel and reusing the offset shrinks the canvas by one. It is silent because
+    the canvas is resized to ``imgsz`` immediately afterwards, and it only happens on odd frames --
+    hence a scan that asserts it actually hit one.
+
+    ``_finish_branch`` is the observation point: it is the first thing that sees the padded canvas, and
+    what it returns is already downscaled to ``imgsz``.
+    """
+    from ultralytics_ooo.core import _RATIO_PAD_COLORS, _ratio_pad_params
+
+    ds = _build(tmp_path / "ratio_far_side", **{**ALL_ON, "slice_prob": 0.0})
+    ds.set_epoch(0, 10)
+    assert ds._closing is False, "the close_aug_epoch window skips the pad entirely"
+    assert ds.im_files and ds.labels, "no images/labels -- this test would be vacuous"
+
+    color = _RATIO_PAD_COLORS["gray"]
+    monkeypatch.setattr(ds, "ratio_pad_color", "gray", raising=False)
+
+    canvas = []
+    orig_finish = ds._finish_branch
+
+    def _spy(label, im):
+        canvas.append(im)
+        return orig_finish(label, im)
+
+    monkeypatch.setattr(ds, "_finish_branch", _spy)
+
+    odd = 0
+    checked = 0
+    for h, w in [(41, 63), (63, 41), (100, 37), (37, 100), (49, 65), (65, 49), (33, 71), (71, 33),
+                 (48, 64), (64, 48), (95, 97), (97, 95)]:
+        frame = (np.arange(h * w * 3, dtype=np.uint32).reshape(h, w, 3) % 251).astype(np.uint8)
+        monkeypatch.setattr(ds, "_degrade_frame_ex", lambda i, _f=frame: (_f, 1.0, True))
+        for target in ("auto", "4:3", "16:9"):
+            monkeypatch.setattr(ds, "ratio_pad_target", target, raising=False)
+            pad = _ratio_pad_params(w, h, target, auto=(target == "auto"))
+            if pad is None:
+                continue
+            new_w, new_h, pad_left, pad_top = pad
+            bottom, right = new_h - h - pad_top, new_w - w - pad_left
+            del canvas[:]
+            ds._build_ratio_sample(0, 0)
+            assert len(canvas) == 1, "the padded canvas never reached _finish_branch"
+            got = canvas[0]
+            assert got.shape == (new_h, new_w, 3), (
+                f"{w}x{h} -> {target}: canvas {got.shape} != ({new_h}, {new_w}, 3) -- the far side got "
+                f"the centred offset instead of the remainder (top={pad_top} bottom={bottom} "
+                f"left={pad_left} right={right})"
+            )
+            ref = np.full((new_h, new_w, 3), color, dtype=np.uint8)
+            ref[pad_top:pad_top + h, pad_left:pad_left + w] = frame
+            assert np.array_equal(got, ref), f"{w}x{h} -> {target} {color}: padded pixels differ"
+            odd += int((pad_top != bottom) or (pad_left != right))
+            checked += 1
+    assert checked >= 10, f"the fixture only reached {checked} pad cases"
+    assert odd >= 1, "no case produced an odd remainder -- the far-side offset would still pass"
+
+
+def test_the_raw_cache_survives_repeated_reads_byte_for_byte(tmp_path):
+    """The other half of the F4 contract: no branch may WRITE THROUGH to a cached frame.
+
+    With ``copy=False`` every degradation branch works on the shared buffer. A branch that started
+    drawing in place would poison the cache for every later sample of that image -- and it would not
+    even show up in the offending sample's output, because the branch result is resized right after.
+    (``_apply_occlusion`` switching from ``out = img.copy()`` to ``out = img`` is the regression this
+    is here to catch -- see _perf_review/inject_check.py.)
+
+    The comparison is against an INDEPENDENT decode of the same file rather than against a snapshot of
+    the dict. On a fixture this small the LRU is clamped to ``min(ni, batch*8, 1000) - 1`` frames, so
+    the resident SET rotates and a snapshot check would only ever look at whichever frames happened to
+    survive the last pass -- here the rotation returns to the same three keys, which is why the
+    snapshot version of this test passed while proving much less than it claimed. A frame must simply
+    still equal the file it was decoded from.
+    """
+    ds = _build(tmp_path / "deg_lru_write", **ALL_ON)
+    ds.set_epoch(0, 10)
+    for _ in range(2):
+        for i in range(len(ds)):
+            ds.get_image_and_label(i)
+
+    hits, misses = ds.raw_cache_stats()[0] + ds._raw_hits, ds.raw_cache_stats()[1] + ds._raw_misses
+    assert ds._raw_cache, "the LRU stayed empty -- this test would be vacuous"
+    assert hits > 0, f"the LRU never handed a resident frame out ({hits} hits / {misses} misses)"
+
+    drifted = []
+    for k, cached in ds._raw_cache.items():
+        ref = cv2.imread(ds.im_files[k], ds.cv2_flag)
+        assert ref is not None, f"cannot re-decode {ds.im_files[k]}"
+        if ref.ndim == 2:
+            ref = ref[..., None]
+        if cached.shape != ref.shape or not np.array_equal(cached, ref):
+            drifted.append(Path(ds.im_files[k]).name)
+    assert not drifted, f"cached frame(s) no longer match the file on disk: {drifted}"

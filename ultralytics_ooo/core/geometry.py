@@ -36,8 +36,18 @@ def slice_geometry(
         raise ValueError(f"slice_geometry: 'bias_x' must be in [-0.5, 0.5], got {bias_x}.")
     if not -0.5 <= bias_y <= 0.5:
         raise ValueError(f"slice_geometry: 'bias_y' must be in [-0.5, 0.5], got {bias_y}.")
-    sw = min(w, max(1, int((1 + overlap_ratio) * w / 2)))
-    sh = min(h, max(1, int((1 + overlap_ratio) * h / 2)))
+    # Tile extent: (1 + overlap) * half the image, floored at ceil(extent / 2).
+    #
+    # The ceil floor is a COVERAGE guarantee, not a nicety. With floor(extent / 2) an ODD extent and a
+    # small overlap can leave ``2 * sw < w``: the two tiles then cannot reach each other and a 1px strip
+    # is covered by NO tile. Measured at bias 0 -- 1279x719 with overlap 0 leaves 1997 px uncovered
+    # (exactly one full row + one full column), 4001x3001 leaves 7001 px, 1281x721 leaves 2001 px; at
+    # the shipped overlap 0.2 the gap is gone (``2 * floor(0.6 * extent) >= extent`` for extent >= 10),
+    # so only ``slice_overlap_ratio`` near 0 was affected. ``ceil`` changes nothing for even extents
+    # (floor == ceil there) and only moves the degenerate odd case -- the same "touch nothing except the
+    # collapsing case" rule as the non-degeneracy clamp below.
+    sw = min(w, max(1, (w + 1) // 2, int((1 + overlap_ratio) * w / 2)))
+    sh = min(h, max(1, (h + 1) // 2, int((1 + overlap_ratio) * h / 2)))
     # Keep both tile extents within the image (the original rule) AND >= 1 px (the non-degeneracy
     # guarantee). Intersecting the two ranges means behaviour is untouched wherever the original clamp
     # was already non-degenerate, and only the collapsing cases move.

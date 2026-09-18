@@ -6,6 +6,12 @@ upstream ``resume_training`` asserts the checkpoint is not already finished. Thi
 patches both methods on ``BaseTrainer`` so that, when ``resume_extend_epochs > 0``, the checkpoint
 metadata (epoch index / epochs / patience) is repaired and the LR schedule rebuilt to the new total,
 mirroring the forked behaviour -- without editing any upstream source.
+
+SEMANTICS (read before touching this code): ``resume_extend_epochs`` is the **new TOTAL epoch
+count**, not an increment. ``resume_extend_epochs=20`` on a checkpoint that finished 4 epochs yields
+a 20-epoch run, not 24 -- which is also why the guard below requires it to exceed the finished count.
+Because the value overwrites ``self.args.epochs``, a larger ``epochs`` passed by the user is
+discarded; that used to happen silently and now warns.
 """
 
 from __future__ import annotations
@@ -49,6 +55,20 @@ def patch_resume(trainer_cls) -> None:
                 raise ValueError(
                     f"resume_extend_epochs={extend_epochs} 必须大于 checkpoint 已完成轮数 {finished_epoch}, "
                     "否则续训无法继续/会倒退。"
+                )
+            # ``resume_extend_epochs`` is the NEW TOTAL epoch count, NOT an increment -- the name reads
+            # as "extend BY n" but the guard above only makes sense under "train TO n", and train.py
+            # documents it that way ("从旧停点续训到该轮数"). The value is written straight into
+            # self.args.epochs below, so a LARGER ``epochs`` the user passed is silently discarded;
+            # that silence was the actual defect (measured: epochs=100 + resume_extend_epochs=20
+            # produced a 20-epoch run and the 100 vanished), so announce it instead.
+            requested = int(getattr(self.args, "epochs", 0) or 0)
+            if requested > extend_epochs:
+                LOGGER.warning(
+                    f"[resume_extend] resume_extend_epochs={extend_epochs} is the NEW TOTAL epoch count, "
+                    f"not an increment, so this run trains to {extend_epochs} epochs and OVERRIDES the "
+                    f"epochs={requested} you passed in. Pass resume_extend_epochs={requested} (or a larger "
+                    f"value) if you meant to keep your own total."
                 )
             # If the ckpt is marked finished (epoch<0, e.g. normal run / stripped), roll the epoch
             # index back to the last finished epoch so resume continues from finished+1.
