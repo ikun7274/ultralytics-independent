@@ -569,9 +569,19 @@ def test_close_aug_epoch_rotates_the_covered_subset(tmp_path_factory):
 
 
 def _capture_messages(fn):
-    """Run ``fn`` and return the messages logged to the ultralytics logger."""
+    """Run ``fn`` and return the messages logged to the ultralytics logger.
+
+    ``reset_log_once()`` FIRST: the dataset dedups repeated construction reports process-wide, so
+    without the reset the second test to build a dataset would capture NOTHING for those lines and read
+    as a failure. Resetting here keeps this observation point honest; the dedup contract itself is
+    asserted in ``test_repeated_construction_reports_are_printed_once``, which needs two constructions
+    inside ONE capture and therefore cannot use two calls of this helper.
+    """
     import logging
 
+    from ultralytics_ooo.pool.dataset import reset_log_once
+
+    reset_log_once()
     records = []
 
     class _H(logging.Handler):
@@ -602,6 +612,10 @@ def test_mask_summary_reports_the_actual_per_branch_counts(tmp_path_factory):
 
     # ratio 0.5 of N=4 originals -> 2 selected slots. Masks are ORIGINAL-level (one bit per image),
     # so blur reports 4 slots too, even though the blur SEGMENT holds 2 samples per image.
+    # Mixed ratios (0.5 for ratio/blur, 1.0 for the rest) -> the ratio stays INLINE per entry, because
+    # there it is branch-specific information. A uniform ratio is hoisted into the header instead, which
+    # the next test asserts -- so the two tests together cover both branches of the new formatting.
+    assert "(all ratios" not in summary, summary
     assert "ratio 2/4 (ratio 0.5)" in summary, summary
     assert "blur 2/4 (ratio 0.5)" in summary, summary
     # untouched branches stay at "all", with their configured ratio printed next to the real count so a
@@ -617,9 +631,15 @@ def test_mask_summary_labels_ratio_1_as_all_augmented(tmp_path_factory):
     ds = _build(root, **{**ALL_ON, "ratio_pad_ratio": 1.0, "blur_ratio": 1.0})
     messages = _capture_messages(lambda: ds.set_epoch(0, 10))
     summary = next(m for m in messages if "augment masks @" in m)
-    assert "ratio all/4 (ratio 1)" in summary, summary
-    assert "blur all/4 (ratio 1)" in summary, summary  # original-level mask: one bit per image
-    assert "compose all/1 (ratio 1)" in summary, summary  # compose is group-level: ceil(4/4) = 1
+    # Every enabled branch drew 1.0 -> the ratio is hoisted ONCE into the header...
+    assert "(all ratios = 1)" in summary, summary
+    # ...and never repeated per entry: the six "(ratio 1)" suffixes this replaces are exactly the noise
+    # the hoist removes. "(all ratios" must not be mistaken for a per-entry suffix, hence the space.
+    assert "(ratio " not in summary, summary
+    assert "slice all/4" in summary, summary
+    assert "ratio all/4" in summary, summary
+    assert "blur all/4" in summary, summary  # original-level mask: one bit per image
+    assert "compose all/1" in summary, summary  # compose is group-level: ceil(4/4) = 1
 
 
 def test_online_augment_header_names_the_slice_segment_sahi(tmp_path_factory):
@@ -1121,3 +1141,38 @@ def test_the_raw_cache_survives_repeated_reads_byte_for_byte(tmp_path):
         if cached.shape != ref.shape or not np.array_equal(cached, ref):
             drifted.append(Path(ds.im_files[k]).name)
     assert not drifted, f"cached frame(s) no longer match the file on disk: {drifted}"
+
+
+def test_repeated_construction_reports_are_printed_once(tmp_path_factory):
+    """A CONFIGURATION report must not be reprinted when the same dataset is built again.
+
+    The trainer really does build this dataset more than once per run -- the validator gets a stock
+    whole-image loader and, with val_slice on, a sliced one too -- and every --timeline / A-B arm
+    rebuilds the whole pipeline inside one process. Measured on _perf_review/ooo7/p4_shadow_e2e.log:
+    "raw-image LRU capped to ..." appeared 9x and "self.ims whole-image cache ..." 3x, byte-identical
+    apart from the train/val prefix.
+
+    Vacuity guard: the fixture MUST reach the capping branch (N=4 with batch=2 gives upstream's bound
+    ``min(4, 16, 1000)-1 = 3`` while slice_raw_cache_size is the shipped 16), otherwise "at most once"
+    would hold because nothing was logged at all -- hence the explicit assertion on the first message's
+    text. The second half proves the dedup keys on the FULL text and cannot hide a change: a different
+    requested size is a different string and is still reported.
+    """
+    root = tmp_path_factory.mktemp("ddd_logonce")
+    messages = _capture_messages(lambda: (_build(root, **ALL_ON), _build(root, **ALL_ON)))
+
+    capped = [m for m in messages if "raw-image LRU capped to" in m]
+    assert len(capped) == 1, f"the identical cap report must print once, got {len(capped)}: {capped}"
+    assert "requested slice_raw_cache_size=16" in capped[0], capped[0]
+    # ``self.prefix`` is ``colorstr("train: ")``, i.e. the text is wrapped in ANSI codes -- so match on
+    # a substring, not on startswith. (The codes are part of the dedup key too, which is harmless: the
+    # same split always produces the same prefix.)
+    assert "train: " in capped[0], capped[0]
+
+    ims = [m for m in messages if "whole-image cache:" in m]
+    assert len(ims) == 1, f"the identical ims report must print once, got {len(ims)}: {ims}"
+
+    # a DIFFERENT configuration is a different string -> still reported
+    other = _capture_messages(lambda: _build(root, **{**ALL_ON, "slice_raw_cache_size": 5}))
+    oc = [m for m in other if "raw-image LRU capped to" in m]
+    assert len(oc) == 1 and "requested slice_raw_cache_size=5" in oc[0], oc

@@ -207,7 +207,7 @@ def _log_sliced_units() -> None:
     loss by ``len(self.dataloader)``. In sliced mode those are the tile count and the tile-batch count,
     i.e. roughly K times the image count, so the printed "Speed: ... per image" is really per tile and
     ``val/box_loss`` is on a different denominator than ``whole_metrics/val/box_loss`` (measured on a
-    3-image val set: 0.83794 vs 0.41349 for the same run). The two口径 must not be compared directly,
+    3-image val set: 0.83794 vs 0.41349 for the same run). The two units must not be compared directly,
     and the number is not the per-image latency a deployment decision would use.
     """
     global _SLICE_UNITS_LOGGED
@@ -217,7 +217,7 @@ def _log_sliced_units() -> None:
     LOGGER.info(
         "val_slice: this validation runs on sub-tiles, so the 'Speed: ... per image' line divides by "
         "the TILE count and val/*_loss divides by the tile-batch count -- both are per sub-tile, not "
-        "per original image, and they are NOT comparable with whole_metrics/val/*_loss. The mAP/精度 "
+        "per original image, and they are NOT comparable with whole_metrics/val/*_loss. The mAP "
         "figures are unaffected: _finalize_sliced_orig maps every prediction back to ORIGINAL-image "
         "pixels and scores one entry per original image."
     )

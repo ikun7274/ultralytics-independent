@@ -50,6 +50,36 @@ from ultralytics_ooo.pool.sampler import SegmentBases
 _SAVE_BRANCHES = {"blur", "weather", "occlusion", "ratio", "compose", "slice"}
 
 
+# ------------------------------------------------------------------------------------- log dedup
+#
+# Some of the reports below describe a CONFIGURATION, not an event, and the trainer builds the same
+# dataset several times per run: the validator is constructed over the stock whole-image loader and,
+# with val_slice on, over the sliced one as well; every --timeline / A-B arm rebuilds the whole
+# pipeline inside ONE process. The identical text was therefore printed over and over -- measured on
+# _perf_review/ooo7/p4_shadow_e2e.log, "raw-image LRU capped to ..." appeared 9x and "self.ims
+# whole-image cache ..." 3x, byte-identical apart from the train/val prefix.
+#
+# The key is the FULL message text, so nothing that differs can be swallowed: a different cap, imgsz,
+# channel count, source or dataset size produces a different string and still prints. Repeats go to
+# DEBUG rather than being dropped, so raising the log level recovers them. Process-local and
+# logging-only: it cannot touch data, slots, masks or the zero-intrusion contract.
+_LOGGED_ONCE: set[str] = set()
+
+
+def _log_once(message: str) -> None:
+    """Emit ``message`` at INFO the first time this process sees it, at DEBUG on every later repeat."""
+    if message in _LOGGED_ONCE:
+        LOGGER.debug(message)
+        return
+    _LOGGED_ONCE.add(message)
+    LOGGER.info(message)
+
+
+def reset_log_once() -> None:
+    """Forget which messages were already emitted (tests only -- training never calls this)."""
+    _LOGGED_ONCE.clear()
+
+
 def _resolve_init_knobs(args: tuple, kwargs: dict) -> tuple[Any, Any]:
     """Resolve the ``hyp`` / ``fraction`` this class needs from the forwarded ``*args``/``**kwargs``.
 
@@ -109,7 +139,9 @@ class OnlinePoolDataset(BaseDataset):
         self._ims_keys: dict[int, None] = {}
         self._ims_cap = _resolve_ims_cap(hyp, self.ni, self.batch_size, self.imgsz, self.channels, self.augment)
         if self._ims_cap > 0:
-            LOGGER.info(f"{self.prefix}{_describe_ims_cap(hyp, self._ims_cap, self.imgsz, self.channels)}")
+            # _log_once, not LOGGER.info: the trainer builds this dataset up to three times per run and
+            # the two reports are byte-identical except for the train/val prefix.
+            _log_once(f"{self.prefix}{_describe_ims_cap(hyp, self._ims_cap, self.imgsz, self.channels)}")
         self._raw_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         _raw_cache_size = int(getattr(hyp, "slice_raw_cache_size", _online_default("slice_raw_cache_size")) or 0)
         if _raw_cache_size > 0:
@@ -136,7 +168,9 @@ class OnlinePoolDataset(BaseDataset):
             _aligned = _legacy_ims_cap(self.ni, self.batch_size)
             self._raw_cache_size = min(_requested, _aligned)
             if self._raw_cache_size != _requested:
-                LOGGER.info(
+                # _log_once, not LOGGER.info: the val dataset is built three times per run, so this line
+                # used to print 3x per arm (9x in a 3-arm log), byte-identically every time.
+                _log_once(
                     f"{self.prefix}raw-image LRU capped to {self._raw_cache_size} frames "
                     f"(requested slice_raw_cache_size={_requested}) to match upstream's whole-image "
                     f"cache bound min(ni, batch*8, 1000)-1 = {_aligned}; a larger read cache would "
@@ -156,6 +190,61 @@ class OnlinePoolDataset(BaseDataset):
         # invisible: at 4000x3000 a frame is 34.3 MiB, so the shipped 256 MiB budget holds 7 of the 16
         # requested frames -- and raising slice_raw_cache_size to 32 would still hold exactly 7.
         self._raw_cache_eff_logged = False
+        # ------------------------------------------------------------------ decode shadow
+        #
+        # The mosaic mix pool is fed BY decode events (_touch_buffer_for_decode). That makes the raw
+        # cache capacity a SEMANTIC input, not a memory knob: enlarge it and the pool appends less
+        # often, so Mosaic.get_indexes samples different partners and the training data changes (the
+        # measurement in the block above is exactly this failure). The consequence today is that the
+        # shipped 16 is a hard ceiling on how much decoding you may memoise.
+        #
+        # The shadow breaks that coupling. The feed decision is taken by a SEPARATE, pixels-free FIFO
+        # that reproduces the SHIPPED baseline, while the real pixel cache is free to grow. Decodes
+        # drop, the sequence of indices handed to ``dataset.buffer`` does not move, and samples stay
+        # byte-identical -- so an existing same-seed baseline remains valid and the change can be
+        # accepted with the instruments that already exist (mAP bit-identity, full-pool digests).
+        #
+        # ``slice_decode_shadow_size``:  0 (default) -> auto: engage ONLY when the real cache outgrew
+        #     the baseline, i.e. exactly when the feed would otherwise move. At the shipped default
+        #     this leaves the shadow OFF, so behaviour is bit-identical and the hot path is untouched.
+        #   > 0 -> pin the shadow to that many frames (set it to ``_legacy_ims_cap`` to reproduce
+        #     upstream's OWN resident set instead of the shipped 16; that raises fidelity but moves
+        #     the data and therefore needs a fresh baseline).
+        #   < 0 -> off: the feed follows the real cache again (the pre-shadow behaviour, kept as the
+        #     A/B control).
+        #
+        # The shadow's byte rule mirrors the real cache's, but against the SHIPPED slice_raw_cache_mb:
+        # that is what makes it a faithful stand-in for the baseline when the real cache is given a
+        # larger budget. It holds ints, not pixels, so its memory is negligible.
+        self._shadow: OrderedDict[int, int] = OrderedDict()
+        self._shadow_size = 0
+        self._shadow_bytes = 0
+        self._shadow_budget = int(float(_online_default("slice_raw_cache_mb") or 0) * (1 << 20))
+        self._shadow_hits = 0
+        self._shadow_misses = 0
+        _shadow_req = int(getattr(hyp, "slice_decode_shadow_size",
+                                  _online_default("slice_decode_shadow_size")) or 0)
+        # The baseline being reproduced: the SHIPPED default of slice_raw_cache_size, clamped exactly
+        # the way the real cache clamps it (hence max(4, ...) and _legacy_ims_cap).
+        _shadow_base = min(max(4, int(_online_default("slice_raw_cache_size") or 0)),
+                           _legacy_ims_cap(self.ni, self.batch_size))
+        if _shadow_req < 0:
+            self._shadow_size = 0
+        elif _shadow_req > 0:
+            self._shadow_size = _shadow_req
+        elif self._raw_cache_size > _shadow_base:
+            self._shadow_size = _shadow_base
+        if self._raw_cache_size <= 0:
+            # A disabled raw cache MUST keep meaning "every read is a decode" -- that is the
+            # legacy/upstream-equivalent path the no-switch contract relies on, so no shadow.
+            self._shadow_size = 0
+        if self._shadow_size > 0:
+            LOGGER.info(
+                f"{self.prefix}raw-image decode shadow ON ({self._shadow_size} frames, "
+                f"{self._shadow_budget / (1 << 20):.0f} MiB budget): the mosaic feed keeps the "
+                f"slice_raw_cache_size={_shadow_base} decode pattern while the pixel cache holds "
+                f"{self._raw_cache_size} frames, so decodes drop without moving the mosaic window."
+            )
         # Per-epoch branch SELECTIONS (see _rebuild_epoch_masks). Each is an ordered list of the
         # ORIGINAL image indices (group indices for compose) that this branch augments this epoch, with
         # its length -- K -- fixed by the CONFIGURED ratio, not by the draw. ``None`` is the "all slots"
@@ -574,25 +663,37 @@ class OnlinePoolDataset(BaseDataset):
                          three mis-wired knobs)
             sel/<count>  ratio < 1  -> the branch's segment holds ``sel * multiplier`` slots and the
                          other ``count - sel`` images own no slot in it
+
+        WHERE THE RATIO IS PRINTED: every entry is ``<branch> <sel|all>/<count>`` and the configured
+        ratio appears ONCE in the header as ``(all ratios = <x>)`` when every enabled branch drew the
+        same value -- the shipped case -- and inline per entry as ``(ratio <x>)`` as soon as they
+        differ, because then the value is branch-specific information rather than a constant. Both
+        forms carry the same information; the header form stops a constant from being printed six
+        times on a line that is emitted once per epoch. Display only: no slot, mask or selection moves.
         """
         if not self.augment:
             return
         n = len(self.labels)
         close_epoch = int(getattr(self, "close_aug_epoch", 0))
         closing = close_epoch > 0 and epochs is not None and epoch >= epochs - close_epoch
-        parts = []
+        entries: list[tuple[str, float]] = []
         for attr, ratio_attr, on, count in self._mask_specs(n):
             if not on:
                 continue  # branch off -> allocates no slots at all
             x = float(getattr(self, ratio_attr, _online_default(ratio_attr)))
             sel = getattr(self, f"_sel_{attr}", None)
             if sel is None:
-                parts.append(f"{attr} all/{count} (ratio {x:g})")
+                label = f"{attr} all/{count}"
             else:
-                part = f"{attr} {len(sel)}/{count} (ratio {x:g})"
+                label = f"{attr} {len(sel)}/{count}"
                 if not sel and not closing:  # during close_aug_epoch a zero is intentional
-                    part += "  <-- NONE"
-                parts.append(part)
+                    label += "  <-- NONE"
+            entries.append((label, x))
+        # One ratio for every enabled branch -> hoist it to the header instead of repeating
+        # "(ratio x)" six times; mixed ratios keep the inline form because then it is per-branch info.
+        ratios = {x for _label, x in entries}
+        uniform = len(ratios) == 1
+        parts = [label if uniform else f"{label} (ratio {x:g})" for label, x in entries]
         # With the target-tile schedule on, the "slice" line above counts (image, tile) UNITS rather than
         # images. Which pass/block this epoch is cannot be inferred from the config, and "why am I seeing
         # this tile again" is otherwise unanswerable from the log -- so print it.
@@ -607,6 +708,8 @@ class OnlinePoolDataset(BaseDataset):
         if not parts:
             return
         head = f"augment masks @ epoch {epoch}"
+        if uniform:
+            head += f" (all ratios = {next(iter(ratios)):g})"
         if closing:
             head += " [close_aug_epoch: every slot emits the original]"
         LOGGER.info(f"{self.prefix}{head}: " + " | ".join(parts))
@@ -979,6 +1082,49 @@ class OnlinePoolDataset(BaseDataset):
         if self.augment and self.cache != "ram":
             self.buffer.append(index)
 
+    def _shadow_counts_as_decode(self, img_index: int, nbytes: int) -> bool:
+        """Would THIS read have been a decode under the shipped raw-cache baseline?
+
+        A pure FIFO-by-first-fill membership test over ints, mirroring
+        :meth:`_load_image_cached_ex` exactly: same "check, evict while over either limit, insert"
+        order, same ``>= 1`` guarantee that a frame is never evicted by its own insert. Because the
+        two structures see the same keys in the same order, this reproduces the baseline's decode
+        pattern -- and therefore the baseline's ``_touch_buffer`` feed -- bit for bit.
+
+        Deliberately NOT LRU: reordering on a hit would change which keys stay resident, hence the
+        decode pattern, hence the mosaic window (the failure the raw cache's own FIFO comment
+        documents).
+        """
+        shadow = self._shadow
+        if img_index in shadow:
+            self._shadow_hits += 1
+            return False
+        self._shadow_misses += 1
+        budget = self._shadow_budget
+        while shadow and (len(shadow) >= self._shadow_size or
+                          (budget and self._shadow_bytes + nbytes > budget)):
+            _old_index, old_nbytes = shadow.popitem(last=False)
+            self._shadow_bytes -= old_nbytes
+        shadow[img_index] = nbytes
+        self._shadow_bytes += nbytes
+        return True
+
+    def _decode_flag_for_feed(self, img_index: int, nbytes: int, real_decode: bool) -> bool:
+        """The decode flag the mosaic feed must act on (see :meth:`_shadow_counts_as_decode`).
+
+        With the shadow off this is the honest decode flag the caller expects. With it on, the feed
+        follows the baseline instead, and the real hit/miss decision stays visible separately in
+        ``_raw_hits`` / ``_raw_misses`` -- so a probe can always tell "did we read the file" from
+        "would the baseline have read the file", which are no longer the same question.
+        """
+        if self._shadow_size <= 0:
+            return real_decode
+        return self._shadow_counts_as_decode(img_index, nbytes)
+
+    def shadow_stats(self) -> tuple[int, int, int, int]:
+        """``(hits, misses, resident_keys, capacity)`` of the decode shadow, process-local."""
+        return (self._shadow_hits, self._shadow_misses, len(self._shadow), self._shadow_size)
+
     def _touch_buffer_for_decode(self, index: int, decoded: bool) -> None:
         """Feed the mosaic buffer ONLY when this sample really decoded its source frame.
 
@@ -994,7 +1140,11 @@ class OnlinePoolDataset(BaseDataset):
         images), which skews the mosaic mix towards whichever images Mosaic itself had just requested.
 
         ``decoded`` is False on an LRU hit. With the LRU disabled (``slice_raw_cache_size=0``) every read
-        really decodes, so the flag is always True and the historical behaviour is preserved verbatim.
+        really decodes, so the flag is always True and the historical behaviour is preserved verbatim --
+        the decode shadow is force-disabled in that configuration for exactly this reason.
+
+        With the shadow on, ``decoded`` carries the SHADOW's verdict rather than the literal hit/miss
+        flag, because the mosaic window must follow the shipped baseline (see ``_shadow_counts_as_decode``).
         """
         if decoded:
             self._touch_buffer(index)
@@ -1591,6 +1741,12 @@ class OnlinePoolDataset(BaseDataset):
         genuine decode -- a cache hit returns early from ``self.ims`` and never reaches the append -- and
         that is the rule ``_touch_buffer_for_decode`` reproduces on the expanded index space. Reporting
         it from here is the only place that knows: the LRU hit/miss decision is made below.
+
+        With the decode shadow engaged the second element is NOT the literal decode flag any more: it is
+        "would the SHIPPED baseline have decoded", which is what the mosaic feed must follow. The two
+        answers diverge precisely when the shadow is doing its job -- the real cache is serving a frame
+        the baseline would have re-read. ``_raw_hits`` / ``_raw_misses`` keep the truthful counts
+        (``_raw_misses`` IS the number of real decode events), so nothing becomes unobservable.
         """
         # Per-worker LRU lookup (see __init__). Disabled when slice_raw_cache_size <= 0.
         size = self._raw_cache_size
@@ -1613,7 +1769,12 @@ class OnlinePoolDataset(BaseDataset):
                 # evicted by first-load time, but that benefit is exactly what breaks the package's
                 # headline "no switches -> byte-for-byte upstream" contract, so it is dropped.
                 self._raw_hits += 1
-                return (hit.copy() if copy else hit), False
+                # The feed flag is NOT simply False here when the decode shadow is on: the real read
+                # was a hit, but the baseline would have decoded -- and it is the baseline that
+                # decides the mosaic window (see _decode_flag_for_feed).
+                return (hit.copy() if copy else hit), self._decode_flag_for_feed(
+                    img_index, hit.nbytes, False
+                )
 
         f = self.im_files[img_index]
         im = imread(f, flags=self.cv2_flag)
@@ -1645,7 +1806,9 @@ class OnlinePoolDataset(BaseDataset):
                 self._raw_cache_bytes -= old.nbytes
             cache[img_index] = im
             self._raw_cache_bytes += im.nbytes
-            return (im.copy() if copy else im), True
+            return (im.copy() if copy else im), self._decode_flag_for_feed(
+                img_index, im.nbytes, True
+            )
         # LRU disabled: nothing was cached, so this read IS a decode and the caller must see that.
         return im, True
 

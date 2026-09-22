@@ -95,10 +95,22 @@ def patch_resume(trainer_cls) -> None:
             # New total + rebuild LR schedule against the new epoch count.
             self.epochs = self.args.epochs = extend_epochs
             self._setup_scheduler()
+            # English ON PURPOSE -- do NOT translate this back. Upstream's Windows log formatter ends
+            # with ``emojis(formatted)`` = ``s.encode().decode("ascii", "ignore")``
+            # (ultralytics/utils/__init__.py, PrefixFormatter.format), i.e. it DELETES every non-ASCII
+            # codepoint at FORMAT time -- after our message and after every handler we could install.
+            # This message used to be Chinese and reached the log as
+            #     "[resume_extend]  checkpoint :  4  ->  20 "
+            # with the whole payload silently gone. Proof, with the message text kept intact by
+            # ``getMessage()`` and destroyed by the formatter: _perf_review/ooo7/log_ascii_probe.py.
+            # Note that a capture-based pytest (tests/test_ooo_branches.py::_capture_messages) reads
+            # ``getMessage()`` and therefore cannot see this defect at all -- tests/test_ooo_log_ascii.py
+            # scans the source literals instead, which is the only observation point that works.
             LOGGER.info(
-                f"[resume_extend] 自动修补 checkpoint 元数据: 已完成 {finished_epoch} 轮 -> "
-                f"续训至 {extend_epochs} 轮 (改写 checkpoint 内保存的 epochs/patience="
-                f"{self.args.patience}; 本轮 EarlyStopping 已在 resume_training 之前按同一值构造)"
+                f"[resume_extend] repaired the checkpoint metadata: {finished_epoch} epochs were already "
+                f"finished, now training to {extend_epochs} epochs (rewrote the epochs/patience saved "
+                f"INSIDE the checkpoint to epochs={extend_epochs}, patience={self.args.patience}; this "
+                f"run's EarlyStopping was already built with the same patience before resume_training)"
             )
         _orig_resume(self, ckpt)
 

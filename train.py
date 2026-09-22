@@ -15,14 +15,14 @@ from ultralytics import YOLO
 假设：8张原图
 	切片：slice_ratio=0.5, slice_all_tiles=False, slice_target_tiles=True, --->  4张有目标切片
 	合成：compose_ratio=0.5, --->  1张合成图
-	比例合成：ratio_pad_ratio=0.5, --->  4张比例图
+	比例调整：ratio_pad_ratio=0.5, --->  4张比例图
 	运动模糊：blur_ratio=0.5, --->  8张模糊图(4长4短)
 	气象退化: weather_ratio=0.5, --->  4张退化图
 	遮挡: occlusion_ratio=0.5, --->  4张遮挡图
 若img_origin=True, 样本池中共有25+8=33张
 若img_origin=False, 样本池中共有25张
 '''
-
+# 增加低光照
 '''
 关于图片切片产生的背景如何处理的问题(3个相关参数)：
   slice_all_tiles: True：每张被选中的原图 4 片全进池(区段 4K); False：随机 1 片(base=K), 可能漏掉目标。
@@ -47,9 +47,9 @@ if __name__ == '__main__':
         #---------训练参数---------------
         data='_mini_val_set/_mini_data.yaml',
         cache=False,                
-        imgsz=320,
-        epochs=2,
-        batch=4,
+        imgsz=640,
+        epochs=10,
+        batch=8,
         workers=2,
         optimizer='MuSGD',
         device="cpu",
@@ -63,7 +63,7 @@ if __name__ == '__main__':
 
 
         # ---------原图---------------
-        img_origin=False, # 是否在样本池里多增加1份原图参与训练            
+        img_origin=True, # 是否在样本池里多增加1份原图参与训练            
 
         # ---------Mosaic在线增强---------------
         mosaic=1.0,
@@ -153,12 +153,11 @@ if __name__ == '__main__':
         
         # ---- 在线增强保存 (人工检查切片是否正确) ----
         # 默认全部关闭: 保存是"同步 JPEG 编码 + 落盘", 直接跑在 DataLoader 取样路径上。
-        # 实测单次带标注写盘 1280x960 = ~24 ms, 4000x3000 = ~183 ms; 切片分支保存用的是
-        # 原图分辨率 tile(不受 degrade_max_side 限幅), 单张可达数十毫秒。6 条分支全开 =
-        # 每样本一次同步写盘, 首轮训练会被 IO 主导, 并产生数万张 JPEG。
+        # 实测单次带标注写盘 1280x960 = ~24 ms, 4000x3000 = ~183 ms; 切片分支保存用的是原图分辨率 tile(不受 degrade_max_side 限幅), 单张可达数十毫秒。
+        # 6 条分支全开 = 每样本一次同步写盘, 首轮训练会被 IO 主导, 并产生数万张 JPEG。
         # 需要人工抽查时: 只开一条分支, 用 slice_save_max 限到 50~200 张。
         # slice_save_annotated=True,   # 保存时画标注框+类别 (仅在下面任一 *_save_dir 非空时生效)
-        # slice_save_max=100,          # 最多保存张数; 0=不限 (不限量会把整轮训练拖成 IO 瓶颈)
+        # slice_save_max=20,          # 最多保存张数; 0=不限 (不限量会把整轮训练拖成 IO 瓶颈)
         # compose_save=False,          # 保存合成图 (默认关闭)
         # slice_save_dir=r"ultralytics-main\img\sliced_save_dir",
         # compose_save_dir=r"ultralytics-main\img\composed_save_dir",

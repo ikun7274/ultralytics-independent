@@ -243,3 +243,8 @@ _verify_probe/
 代码讲解-算法新手版.md
 
 Instruction/
+
+# Local scratch / archive (do not sync)
+_/
+_mini_val_set/
+.ruff_cache/

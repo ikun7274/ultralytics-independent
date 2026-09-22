@@ -164,6 +164,35 @@ _ONLINE_DEFAULTS: dict[str, Any] = {
     # With the default 256 MiB: 720p keeps all 16 frames, 4000x3000 keeps 7. 0 = trust
     # slice_raw_cache_size (only do that when you know the frame size).
     "slice_raw_cache_mb": 256,
+    # DECODE SHADOW for the raw-image cache (see pool/dataset.py, ``_shadow_counts_as_decode``).
+    # The mosaic mix pool is fed by DECODE events, which is why enlarging slice_raw_cache_size above
+    # used to change the training data instead of just saving work. With the shadow on, a pixels-free
+    # FIFO reproduces the shipped baseline's decode pattern and takes over the feed, so the pixel cache
+    # can grow freely: decodes fall, the indices pushed into dataset.buffer do not move, and samples
+    # stay byte-identical (acceptance can reuse the existing mAP bit-identity check).
+    #   0 (default) -> auto: engage only once slice_raw_cache_size exceeds its shipped default, i.e.
+    #                  exactly when the feed would otherwise change. Leaves the shadow OFF at the
+    #                  default configuration -> bit-identical behaviour, no hot-path cost.
+    #   > 0 -> pin the shadow to that many frames. Use _legacy_ims_cap (= min(ni, batch*8, 1000)-1,
+    #          i.e. 63 at batch 8 for any dataset with >= 64 images) to reproduce UPSTREAM's own
+    #          resident set. That is higher fidelity than the shipped 16 -- but it MOVES the feed, so
+    #          it needs a new baseline and cannot be accepted by equivalence.
+    #   < 0 -> off: the feed follows the real cache again (pre-shadow behaviour, kept as the A/B
+    #          control). Raising slice_raw_cache_size with the shadow off is the old data-changing
+    #          behaviour.
+    # The shadow mirrors the SHIPPED slice_raw_cache_mb as its byte rule, so it stays a faithful
+    # stand-in even when the real cache is given a larger budget. It stores ints, not pixels.
+    "slice_decode_shadow_size": 0,
+    # --- upstream's own whole-image cache (self.ims) ---
+    # The resolved cap is reported once per dataset construction as "self.ims whole-image cache: N
+    # frames x S MiB = T MiB/worker [ims_cache_frames=<source>, ...]". Tune these two to trade
+    # re-decodes for memory: 0 frames = auto = min(upstream's own bound, the ims_cache_mb budget);
+    # > 0 pins the frame count; < 0 restores upstream's formula verbatim.
+    #
+    # WHY THE ADVICE LIVES HERE AND NOT IN THE LOG LINE: it used to be appended to that report, but a
+    # sentence that never changes is noise from the second construction on -- and the trainer builds
+    # this dataset up to three times per run, so the line had become the longest AND the most repeated
+    # one. The report now carries state only (see pool/constants.py::_describe_ims_cap).
     "ims_cache_frames": 0,
     "ims_cache_mb": 1024,
     # DataLoader prefetch depth, in BATCHES per worker. Stock build.py hardcodes 4 and offers no
@@ -307,8 +336,11 @@ def _describe_ims_cap(hyp: Any, cap: int, imgsz: int | list[int], channels: int)
         source = "upstream formula"
     else:
         source = "auto=min(upstream, budget)"
+    # No "tune ims_cache_frames / ims_cache_mb ..." tail here any more: this string is emitted once per
+    # dataset construction (up to three per run), so constant advice ends up repeated while the state
+    # is what the reader needs. The advice moved to the knobs' own comment in _ONLINE_DEFAULTS.
     return (
         f"self.ims whole-image cache: {cap} frames x {frame / (1 << 20):.2f} MiB = "
         f"{cap * frame / (1 << 20):.0f} MiB/worker [ims_cache_frames={source}, imgsz={imgsz}, "
-        f"channels={channels}]; tune ims_cache_frames / ims_cache_mb to trade re-decodes for memory"
+        f"channels={channels}]"
     )
